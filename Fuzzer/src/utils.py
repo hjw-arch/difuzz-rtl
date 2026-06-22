@@ -89,8 +89,18 @@ def save_mismatch(base, proc_num, out, sim_input: simInput, data: list, num): #,
     shutil.copy(asm, out + '/asm/id_{}.S'.format(num))
     shutil.copy(hexfile, out + '/hex/id_{}.hex'.format(num))
 
-def setup(dut, toplevel, template, out, proc_num, debug, minimizing=False, no_guide=False):
-    mutator = rvMutator(no_guide=no_guide)
+def setup(dut, toplevel, template, out, proc_num, debug, minimizing=False,
+          no_guide=False, target_module=None, seed_scheduler='sgmu',
+          target_rare_horizon=8, target_max_energy=8,
+          phase_policy='default', fuzzer_backend='difuzzrtl'):
+    mutator = rvMutator(
+        no_guide=no_guide,
+        target_module=target_module,
+        seed_scheduler=seed_scheduler,
+        target_rare_horizon=target_rare_horizon,
+        target_max_energy=target_max_energy,
+        phase_policy=phase_policy,
+        fuzzer_backend=fuzzer_backend)
 
     cc = 'riscv64-unknown-elf-gcc'
     elf2hex = 'riscv64-unknown-elf-elf2hex'

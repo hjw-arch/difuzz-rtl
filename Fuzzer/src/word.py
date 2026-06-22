@@ -213,7 +213,7 @@ def word_csr_i(opcode, syntax, xregs, fregs, imms, symbols):
     return (tpe, insts)
 
 def word_sfence(opcode, syntax, xregs, fregs, imms, symbols):
-    tpe = NONE
+    tpe = MEM_R
     pt_symbol = random.choice([ 'pt0', 'pt1', 'pt2', 'pt3' ])
 
     imms += [ ('uimm1', 1), ('uimm6', 8) ]

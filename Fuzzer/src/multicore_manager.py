@@ -1,11 +1,16 @@
 import os
 import random
 import time
-import sysv_ipc as ipc
 import cocotb
+
+try:
+    import sysv_ipc as ipc
+except ImportError:
+    ipc = None
 
 from cocotb.decorators import coroutine
 from cocotb.triggers import RisingEdge, Timer
+from src.coverage_utils import get_cov_log_row, get_cov_prefix_aggregate
 
 NORMAL          = 0
 ERR_COMPILE     = 1
@@ -36,11 +41,18 @@ class procState():
 proc_state = procState()
 
 class procManager():
-    def __init__(self, multicore: int, out: str, date: str):
+    def __init__(self, multicore: int, out: str, date: str,
+                 module_cov_names=None):
+        if ipc is None:
+            raise RuntimeError(
+                'MULTICORE requires the Python sysv_ipc package. '
+                'Run single-core fuzzing or install sysv_ipc before using MULTICORE.')
+
         random.seed(time.time())
 
         self.out = out
         self.cov_log = out + '/cov_log_{}.txt'.format(date)
+        self.module_cov_names = module_cov_names or []
        
         self.mNum = len(os.listdir(out + '/mismatch/sim_input'))
         self.cNum = len(os.listdir(out + '/corpus'))
@@ -149,7 +161,7 @@ class procManager():
     def store_covmap(self, proc_num, start_time, start_iter, num_iter):
         self.covMap_sem.P()
         cov_sum = 0
-        cov_files = []
+        cov_file_sums = {}
         covmaps = os.listdir(self.out + '/covmap-{:02}'.format(proc_num))
 
         for cov_file in covmaps:
@@ -172,15 +184,18 @@ class procManager():
                 cov_map[n] = cov_map[n] | int(line[n])
                 cov_sum = cov_sum + cov_map[n]
 
+            cov_file_sums[cov_file[:-4]] = sum(cov_map)
             cov_string = ''.join(str(e) for e in cov_map)
             fd = open(self.out + '/covmap/{}'.format(cov_file), 'w')
             fd.write(cov_string)
             fd.close()
 
         elapsed_time = time.time() - start_time
+        module_covs = get_cov_prefix_aggregate(
+            self.module_cov_names, cov_file_sums)
         fd = open(self.cov_log, 'a')
-        fd.write('{:<10}\t{:<10}\t{:<10}\n'.
-                 format(elapsed_time, start_iter + num_iter, cov_sum))
+        fd.write(get_cov_log_row(elapsed_time, start_iter + num_iter,
+                                 cov_sum, self.module_cov_names, module_covs))
         fd.close()
         self.covMap_sem.V()
 

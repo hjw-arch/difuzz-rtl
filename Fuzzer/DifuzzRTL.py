@@ -6,6 +6,12 @@ from datetime import datetime
 from cocotb.regression import TestFactory
 
 from src.utils import save_file
+from src.coverage_utils import (
+    ensure_target_module,
+    get_cov_log_header,
+    get_cov_module_names,
+    get_zero_cov_row,
+)
 from src.env_parser import envParser
 from src.multicore_manager import proc_state, procManager
 
@@ -51,6 +57,14 @@ parser.add_option('debug', 0, 'Debugging?')
 parser.add_option('minimize', 0, 'Minimizing?')
 parser.add_option('prob_intr', 0, 'Probability of asserting interrupt')
 parser.add_option('no_guide', 0, 'Only random testing?')
+parser.add_option('target_module', None, 'Target module instance for SGMU target coverage')
+parser.add_option('seed_scheduler', 'sgmu', 'Seed scheduler: sgmu, target_high, target_new, uniform')
+parser.add_option('target_bitmap_sample_period', 1, 'Sample target coverage address every N cycles')
+parser.add_option('target_rare_horizon', 8, 'SGMU rarity horizon')
+parser.add_option('target_max_energy', 8, 'SGMU maximum consecutive mutation budget')
+parser.add_option('phase_policy', 'default', 'Phase policy: default or mutation_only')
+parser.add_option('fuzzer_backend', 'difuzzrtl', 'Fuzzer backend: difuzzrtl or isafuzz')
+parser.add_option('skip_checker', 0, 'Skip DifuzzRTL ISA/RTL signature checker')
 
 parser.print_help()
 parser.parse_option()
@@ -64,6 +78,10 @@ parser.arg_map.pop('minimize', None)
 toplevel = parser.arg_map['toplevel'][0]
 template = parser.arg_map['template'][0]
 debug = parser.arg_map['debug'][0]
+target_module = parser.arg_map['target_module'][0]
+module_cov_names = ensure_target_module(
+    get_cov_module_names(top_name=toplevel),
+    target_module)
 
 
 if not os.path.isdir(out):
@@ -89,8 +107,7 @@ if not os.path.isdir(out + '/corpus'):
 date = datetime.today().strftime('%Y%m%d')
 cov_log = out + '/cov_log_{}.txt'.format(date)
 if (multicore or record) and not os.path.isfile(cov_log):
-    save_file(cov_log, 'w', '{:<10}\t{:<10}\t{:<10}\n'.
-              format('time', 'iter', 'coverage'))
+    save_file(cov_log, 'w', get_cov_log_header(module_cov_names))
 
 start_time = time.time()
 
@@ -111,10 +128,9 @@ if not multicore:
     factory.generate_tests()
 
 else:
-    manager = procManager(multicore, out, date)
+    manager = procManager(multicore, out, date, module_cov_names)
 
-    save_file(cov_log, 'a', '{:<10}\t{:<10}\t{:<10}\n'.
-              format(0, 0, 0))
+    save_file(cov_log, 'a', get_zero_cov_row(module_cov_names))
     if not os.path.isdir(out + '/covmap'):
         os.makedirs(out + '/covmap')
     if not os.path.isdir(out + '/coverage'):
@@ -127,7 +143,7 @@ else:
         if not os.path.isfile(out + '/coverage/cov_log_{}_{}.txt'.
                               format(date, i)):
             save_file(out + '/coverage/cov_log_{}_{}.txt'.format(date, i),
-                      'w', '{:<10}\t{:<10}\t{:<10}\n'.format('time', 'iter', 'coverage'))
+                      'w', get_cov_log_header(module_cov_names))
 
     num_tot_iter = parser.arg_map['num_iter'][0]
     num_iter = 5000

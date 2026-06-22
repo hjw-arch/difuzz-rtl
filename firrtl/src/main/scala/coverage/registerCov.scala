@@ -110,7 +110,7 @@ class regCoverage extends Transform {
 
     print("====================== Instrumenting metaAssert ===================\n")
     val assertCircuit = instrCircuit map { m: DefModule =>
-      val instrAssert = new InstrAssert(m, moduleInfos(m.name))
+      val instrAssert = new InstrAssert(m, moduleInfos(m.name), extModules)
       val mod = instrAssert.instrument()
       // convertStop.printLog()
       mod

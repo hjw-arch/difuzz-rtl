@@ -6,9 +6,9 @@ import firrtl._
 
 import scala.collection.mutable.ListBuffer
 
-class InstrAssert(mod: DefModule, mInfo: moduleInfo) {
+class InstrAssert(mod: DefModule, mInfo: moduleInfo, extModules: Seq[String]) {
   private val mName = mod.name
-  private val insts = mInfo.insts
+  private val insts = mInfo.insts.filter(inst => !extModules.contains(inst.module))
 
   def instrument(): DefModule = {
     mod match {
@@ -93,7 +93,7 @@ class InstrAssert(mod: DefModule, mInfo: moduleInfo) {
     val ports = mod.ports
     val (clockName, resetName) = ports.foldLeft[(String, String)](("None", "None"))(
       (tuple, p) => {
-        if (p.name == "clock") (p.name, tuple._2)
+        if (p.tpe == ClockType || p.name == "clock") (p.name, tuple._2)
         else if (p.name contains "reset") (tuple._1, p.name)
         else tuple
       })

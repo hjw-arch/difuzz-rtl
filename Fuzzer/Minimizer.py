@@ -101,7 +101,11 @@ def Minimize(dut, toplevel,
                         if ret == proc_state.ERR_ISA_TIMEOUT: continue
 
                         try:
-                            (ret, coverage) = yield rtlHost.run_test(rtl_input, assert_intr)
+                            result = yield rtlHost.run_test(rtl_input, assert_intr)
+                            if len(result) == 3:
+                                (ret, coverage, _module_covs) = result
+                            else:
+                                (ret, coverage) = result
                         except:
                             stop[0] = proc_state.ERR_RTL_SIM
                             break

@@ -470,7 +470,7 @@ class InstrCov(mod: DefModule, mInfo: moduleInfo, extModules: Seq[String], val m
     val ports = mod.ports
     val (clockName, resetName) = ports.foldLeft[(String, String)](("None", "None"))(
       (tuple, p) => {
-        if (p.name == "clock" || p.name == "gated_clock") (p.name, tuple._2)
+        if (p.tpe == ClockType || p.name == "clock" || p.name == "gated_clock") (p.name, tuple._2)
         else if (p.name contains "reset") (tuple._1, p.name)
         else tuple
       })
@@ -479,6 +479,5 @@ class InstrCov(mod: DefModule, mInfo: moduleInfo, extModules: Seq[String], val m
     (clockName, resetName, hasClockAndReset)
   }
 }
-
 
 
