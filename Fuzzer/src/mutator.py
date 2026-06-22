@@ -3,6 +3,12 @@ import random
 from copy import deepcopy
 
 from inst_generator import Word, rvInstGenerator, PREFIX, MAIN, SUFFIX
+from fuzzer.scheduler import ScheduledCorpus
+from fuzzer.program_backends import (
+    FUZZER_BACKEND_ISAFUZZ,
+    ISAFuzzDifuzzBackend,
+    normalize_fuzzer_backend,
+)
 
 """ Mutation phases """
 GENERATION = 0
@@ -22,7 +28,8 @@ templates = [ 'p-m', 'p-s', 'p-u',
               'v-u']
 
 class simInput():
-    def __init__(self, prefix: list, words: list, suffix: list, ints: list, data_seed: int, template: int):
+    def __init__(self, prefix: list, words: list, suffix: list, ints: list,
+                 data_seed: int, template: int, structured_payload=None):
         self.prefix = prefix
         self.words = words
         self.suffix = suffix
@@ -34,6 +41,7 @@ class simInput():
 
         self.data_seed = data_seed
         self.template = template
+        self.structured_payload = structured_payload
 
     def save(self, name, data=[]):
         prefix_insts = self.get_prefix()
@@ -91,9 +99,22 @@ class simInput():
 
 
 class rvMutator():
-    def __init__(self, max_data_seeds=100, corpus_size=1000, no_guide=False):
+    def __init__(self, max_data_seeds=100, corpus_size=1000,
+                 no_guide=False, target_module=None,
+                 seed_scheduler='sgmu', target_rare_horizon=8,
+                 target_max_energy=8, phase_policy='default',
+                 fuzzer_backend='difuzzrtl', target_cost_aware=False):
         self.corpus_size = corpus_size
-        self.corpus = []
+        self.scheduled_corpus = ScheduledCorpus(
+            mode=seed_scheduler,
+            cap=corpus_size,
+            rare_horizon=target_rare_horizon,
+            max_energy=target_max_energy,
+            cost_aware=bool(target_cost_aware),
+            rng=random,
+        )
+        self.corpus = self.scheduled_corpus.items
+        self.target_module = target_module or None
 
         self.phases = [GENERATION, MUTATION, MERGE]
         self.phase = GENERATION
@@ -104,12 +125,82 @@ class rvMutator():
 
         self.max_nWords = 200
         self.no_guide = no_guide
+        self.phase_policy = str(phase_policy or 'default').strip().lower()
+        if self.phase_policy not in ['default', 'mutation_only']:
+            self.phase_policy = 'default'
 
         self.max_data = max_data_seeds
         self.random_data = {}
         self.data_seeds = []
 
         self.inst_generator = rvInstGenerator('RV64G')
+        self.fuzzer_backend = normalize_fuzzer_backend(fuzzer_backend)
+        self.structured_backend = None
+        self.last_parent_seed_id = None
+        self.last_parent_main_words = 0
+        self.last_parent_static_insts = 0
+        if self.fuzzer_backend == FUZZER_BACKEND_ISAFUZZ:
+            self.structured_backend = ISAFuzzDifuzzBackend(random)
+            self.structured_backend.prepare()
+
+    def target_new_bits(self, target_hit_bits):
+        return self.scheduled_corpus.new_targets(target_hit_bits or set())
+
+    def observe_target_yield_result(self, target_new_bits, admitted=False,
+                                    cost=None):
+        self.scheduled_corpus.observe(
+            target_new_bits or set(),
+            admitted=bool(admitted),
+            cost=cost)
+
+    def choose_corpus_entry(self):
+        choice = self.scheduled_corpus.choose()
+        if choice is None:
+            return None, None
+        return choice.item, choice.seed_id
+
+    def _static_insts(self, sim_input):
+        if sim_input is None:
+            return 0
+        return sum(
+            int(getattr(word, 'len_insts', 0) or 0)
+            for word in sim_input.prefix + sim_input.words + sim_input.suffix
+        )
+
+    def _remember_parent(self, sim_input, parent_seed_id):
+        self.last_parent_seed_id = parent_seed_id
+        self.last_parent_main_words = len(getattr(sim_input, 'words', []) or [])
+        self.last_parent_static_insts = self._static_insts(sim_input)
+
+    def get_last_selection_summary(self):
+        selections = getattr(self.scheduled_corpus, 'pending_selections', [])
+        selection = selections[-1] if selections else None
+        if selection is None:
+            return {
+                'parent_seed_id': self.last_parent_seed_id
+                if self.last_parent_seed_id is not None else '',
+                'parent_main_words': self.last_parent_main_words,
+                'parent_static_insts': self.last_parent_static_insts,
+                'reason': '',
+                'energy': 0,
+                'opportunity': 0.0,
+                'conversion': 0.0,
+                'cost_norm': 1.0,
+                'value': 0.0,
+                'best_alt_value': 0.0,
+            }
+        return {
+            'parent_seed_id': selection.seed_id,
+            'parent_main_words': self.last_parent_main_words,
+            'parent_static_insts': self.last_parent_static_insts,
+            'reason': selection.reason,
+            'energy': selection.energy,
+            'opportunity': selection.opportunity,
+            'conversion': selection.conversion,
+            'cost_norm': selection.cost_norm,
+            'value': selection.value,
+            'best_alt_value': selection.best_alt_value,
+        }
 
     def add_data(self, new_data=[]):
         if len(self.data_seeds) == self.max_data:
@@ -257,7 +348,8 @@ class rvMutator():
                 new_target.append(word)
 
         if part == PREFIX:
-            min_input = simInput(new_target, words, suffix, ints, data_seed, template)
+            min_input = simInput(new_target, words, suffix, ints, data_seed,
+                                 template, sim_input.structured_payload)
         elif part == MAIN:
             new_ints = []
             k = 0
@@ -269,9 +361,12 @@ class rvMutator():
 
                 k += new_target[i].len_insts
 
-            min_input = simInput(prefix, new_target, suffix, new_ints, data_seed, template)
+            min_input = simInput(prefix, new_target, suffix, new_ints,
+                                 data_seed, template,
+                                 sim_input.structured_payload)
         else:
-            min_input = simInput(prefix, words, new_target, ints, data_seed, template)
+            min_input = simInput(prefix, words, new_target, ints, data_seed,
+                                 template, sim_input.structured_payload)
 
         data = self.random_data[data_seed]
         return (min_input, data)
@@ -302,7 +397,9 @@ class rvMutator():
             new_target = self.reset_labels(tmps, part)
             words_map[part] = new_target
 
-        del_input = simInput(words_map[PREFIX], words_map[MAIN], words_map[SUFFIX], new_ints, data_seed, template)
+        del_input = simInput(words_map[PREFIX], words_map[MAIN],
+                             words_map[SUFFIX], new_ints, data_seed, template,
+                             sim_input.structured_payload)
         data = self.random_data[data_seed]
 
         return (del_input, data)
@@ -353,6 +450,41 @@ class rvMutator():
 
         return words
 
+    def _make_structured_input(self, result):
+        prefix, words, suffix, data, template, payload = result
+        data_seed = self.add_data(data)
+        i_len = sum(word.len_insts for word in words)
+        ints = [0 for _ in range(i_len)]
+        return (
+            simInput(prefix, words, suffix, ints, data_seed, template,
+                     structured_payload=payload),
+            self.random_data[data_seed],
+        )
+
+    def _get_structured_generation(self, fixed_template=None):
+        if self.structured_backend is None:
+            return None
+        self.last_parent_seed_id = None
+        self.last_parent_main_words = 0
+        self.last_parent_static_insts = 0
+        result = self.structured_backend.generate(
+            fixed_template=fixed_template, with_payload=True)
+        return self._make_structured_input(result)
+
+    def _get_structured_mutation(self):
+        if self.structured_backend is None:
+            return None
+        seed_si, parent_seed_id = self.choose_corpus_entry()
+        if seed_si is None:
+            return None
+        self._remember_parent(seed_si, parent_seed_id)
+        payload = getattr(seed_si, 'structured_payload', None)
+        result = self.structured_backend.mutate(
+            payload, parent_key=parent_seed_id)
+        if result is None:
+            return None
+        return self._make_structured_input(result)
+
     def get(self, assert_intr=False):
         i_len = 0
         prefix = []
@@ -363,7 +495,17 @@ class rvMutator():
 
         data_seed = -1
         template = -1
-        if self.phase == GENERATION:
+        self.scheduled_corpus.begin_input()
+        phase = self.phase
+        if phase in [MUTATION, MERGE] and not self.corpus:
+            phase = GENERATION
+
+        if phase == GENERATION:
+            if self.fuzzer_backend == FUZZER_BACKEND_ISAFUZZ:
+                fixed_template = None if template == -1 else template
+                structured = self._get_structured_generation(fixed_template)
+                if structured is not None:
+                    return structured
             for n in range(self.num_prefix):
                 word = self.inst_generator.get_word(PREFIX)
                 prefix.append(word)
@@ -374,9 +516,14 @@ class rvMutator():
                 word = self.inst_generator.get_word(SUFFIX)
                 suffix.append(word)
 
-        elif self.phase in [ MUTATION, MERGE ]:
-            if self.phase == MUTATION:
-                seed_si = random.choice(self.corpus)
+        elif phase in [ MUTATION, MERGE ]:
+            if self.fuzzer_backend == FUZZER_BACKEND_ISAFUZZ:
+                structured = self._get_structured_mutation()
+                if structured is not None:
+                    return structured
+            if phase == MUTATION:
+                seed_si, _parent_seed_id = self.choose_corpus_entry()
+                self._remember_parent(seed_si, _parent_seed_id)
                 seed_prefix = deepcopy(seed_si.prefix)
                 seed_words = deepcopy(seed_si.words)
                 seed_suffix = deepcopy(seed_si.suffix)
@@ -384,8 +531,9 @@ class rvMutator():
                 template = seed_si.get_template()
             else:
                 seed_words = []
-                seed_si1 = random.choice(self.corpus)
-                seed_si2 = random.choice(self.corpus)
+                seed_si1, _parent_seed_id = self.choose_corpus_entry()
+                seed_si2, _ = self.choose_corpus_entry()
+                self._remember_parent(seed_si1, _parent_seed_id)
 
                 seed_prefix = deepcopy(seed_si1.prefix)
                 si1_words = deepcopy(seed_si1.words)
@@ -436,8 +584,10 @@ class rvMutator():
         return (sim_input, data)
 
     def update_phase(self, it):
-        if it < self.corpus_size / 10 or self.no_guide:
+        if (it + 1) < self.corpus_size / 10 or self.no_guide:
             self.phase = GENERATION
+        elif self.phase_policy == 'mutation_only':
+            self.phase = MUTATION
         else:
             rand = random.random()
             if rand < 0.1:
@@ -447,9 +597,26 @@ class rvMutator():
             else:
                 self.phase = MERGE
 
-    def add_corpus(self, sim_input):
-        self.corpus.append(sim_input)
+    def add_corpus(self, sim_input, coverage=0, module_covs=None,
+                   target_hit_bits=None, initial_cost=None):
+        target_hit_bits = set(target_hit_bits or set())
+        module_covs = module_covs or {}
+        target_score = 0
+        if self.target_module:
+            target_score = int(module_covs.get(self.target_module, 0) or 0)
+        elif target_hit_bits:
+            target_score = len(target_hit_bits)
+        target_new_bits = self.target_new_bits(target_hit_bits)
+        added = self.scheduled_corpus.add(
+            sim_input,
+            targets=target_hit_bits,
+            target_score=target_score,
+            target_new_score=len(target_new_bits),
+            total_score=int(coverage or 0),
+            initial_cost=initial_cost,
+        )
+        if not added:
+            return False
 
         self.num_words = min(self.num_words + 1, self.max_nWords)
-        if len(self.corpus) > self.corpus_size:
-            self.corpus.pop(0)
+        return True

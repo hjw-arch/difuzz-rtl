@@ -9,19 +9,26 @@ from mutator import simInput, templates, P_M, P_S, P_U, V_U
 
 class rvPreProcessor():
     def __init__(self, cc, elf2hex, template='Template', out_base ='.', proc_num=0):
-        self.cc = cc
-        self.elf2hex = elf2hex
+        self.cc = os.getenv('RISCV_GCC', cc)
+        self.elf2hex = os.getenv('RISCV_ELF2HEX',
+                                  os.getenv('ELF2HEX', elf2hex))
+        self.march = os.getenv('RISCV_MARCH', 'rv64imafd')
+        self.mabi = os.getenv('RISCV_MABI', 'lp64')
         self.template = template
         self.base = out_base
         self.proc_num = proc_num
 
         self.er_num = 0
-        self.cc_args = [ cc, '-march=rv64g', '-mabi=lp64', '-static', '-mcmodel=medany',
-                         '-fvisibility=hidden', '-nostdlib', '-nostartfiles',
-                         '-I', '{}/include'.format(template),
-                         '-T', '{}/include/link.ld'.format(template) ]
+        self.cc_args = [
+            self.cc, '-march={}'.format(self.march),
+            '-mabi={}'.format(self.mabi),
+            '-static', '-mcmodel=medany', '-fvisibility=hidden',
+            '-nostdlib', '-nostartfiles',
+            '-I', '{}/include'.format(template),
+            '-T', '{}/include/link.ld'.format(template),
+        ]
 
-        self.elf2hex_args = [ elf2hex, '--bit-width', '64', '--input' ]
+        self.elf2hex_args = [ self.elf2hex, '--bit-width', '64', '--input' ]
 
     def get_symbols(self, elf_name, sym_name):
         # symbol_file = self.base + '/.input.symbols'
@@ -144,8 +151,6 @@ class rvPreProcessor():
             if cc_ret != -9: break
 
         if cc_ret == 0:
-            subprocess.call(cc_args)
-
             elf2hex_args = self.elf2hex_args + [ elf_name, '--output', hex_name]
             subprocess.call(elf2hex_args)
             symbols= self.get_symbols(elf_name, sym_name)
@@ -162,7 +167,7 @@ class rvPreProcessor():
             if version in [ V_U ]:
                 max_cycles = 200000
 
-            isa_input = isaInput(elf_name, isa_intr_name)
+            isa_input = isaInput(elf_name, isa_intr_name, symbols, data)
             rtl_input = rtlInput(hex_name, rtl_intr_name, data, symbols, max_cycles)
         else:
             isa_input = None

@@ -5,7 +5,10 @@ CWD=$(shell pwd)
 SIM=verilator
 CMD=verilator
 
-PYTHONPATH := $(CWD)/src:$(CWD)/RTLSim/src:$(PYTHONPATH)
+export PYTHONPATH := $(CWD)/../../..:$(CWD):$(CWD)/src:$(CWD)/RTLSim/src:$(PYTHONPATH)
+export PATH := $(CWD)/../.local/bin:$(PATH)
+PYTHONWARNINGS ?= ignore::DeprecationWarning
+export PYTHONWARNINGS
 
 TOPLEVEL_LAGN ?= verilog
 
@@ -13,6 +16,9 @@ TOPLEVEL ?= $(VFILE)
 VERILOG_SOURCES = $(CWD)/../Benchmarks/Verilog/$(VFILE).v
 COCOTB_HDL_TIMEUNIT=1us
 COCOTB_HDL_TIMEPRECISION=1us
+
+export DIFUZZRTL_VFILE=$(VERILOG_SOURCES)
+export DIFUZZRTL_TOPLEVEL=$(TOPLEVEL)
 
 OUT ?= output
 

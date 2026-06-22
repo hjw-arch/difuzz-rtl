@@ -1,10 +1,10 @@
-import sys
 import cocotb
 
 from cocotb.decorators import coroutine
 from cocotb.triggers import Timer, RisingEdge
 from reader.tile_reader import tileSrcReader
 from adapters.tile_adapter import tileAdapter
+from fuzzer.rtl_coverage import DutCoverageObserver
 
 SUCCESS = 0
 ASSERTION_FAIL = 1
@@ -38,6 +38,13 @@ class rvRTLhost():
 
         self.dut = dut
         self.adapter = tileAdapter(dut, port_names, monitor, self.debug)
+        self.toplevel = toplevel
+        self.coverage = DutCoverageObserver(dut, toplevel)
+        self.module_cov_names = self.coverage.module_cov_names
+        self.last_target_cov_hits = set()
+        self.last_target_cov_module = None
+        self.last_target_handle_count = 0
+        self.last_cycles = 0
 
     def debug_print(self, message):
         if self.debug:
@@ -104,13 +111,20 @@ class rvRTLhost():
         fd.close()
 
     def get_covsum(self):
-        cov_mask = (1 << len(self.dut.io_covSum)) - 1
-        return self.dut.io_covSum.value & cov_mask
+        return self.coverage.total_cov()
+
+    def get_cov_stats(self):
+        return self.coverage.cov_stats()
 
     @coroutine
-    def run_test(self, rtl_input: rtlInput, assert_intr: bool):
+    def run_test(self, rtl_input: rtlInput, assert_intr: bool,
+                 target_bitmap_module=None, target_bitmap_sample_period=1):
 
         self.debug_print('[RTLHost] Start RTL simulation')
+        self.last_target_cov_hits = set()
+        self.last_target_cov_module = target_bitmap_module
+        self.last_target_handle_count = 0
+        self.last_cycles = 0
 
         fd = open(rtl_input.hexfile, 'r')
         lines = fd.readlines()
@@ -160,12 +174,22 @@ class rvRTLhost():
         clk = self.dut.clock
         clk_driver = cocotb.fork(self.clock_gen(clk))
         clkedge = RisingEdge(clk)
+        target_cov_trace_handles = self.coverage.target_trace_handles(
+            target_bitmap_module)
+        self.last_target_handle_count = len(target_cov_trace_handles)
+        target_bitmap_sample_period = max(
+            int(target_bitmap_sample_period or 1), 1)
 
         yield self.reset(clk, self.dut.metaReset, self.dut.reset)
 
         self.adapter.start(memory, ints)
         for i in range(max_cycles):
             yield clkedge
+            if target_cov_trace_handles and \
+               i % target_bitmap_sample_period == 0:
+                self.coverage.sample_tagged_handles(
+                    target_cov_trace_handles,
+                    self.last_target_cov_hits)
 
             if i % 100 == 0:
                 tohost = memory[tohost_addr]
@@ -173,6 +197,7 @@ class rvRTLhost():
                     break
                 else:
                     self.adapter.probe_tohost(tohost_addr)
+        self.last_cycles = i + 1
 
         yield self.adapter.stop()
         clk_driver.kill()
@@ -183,18 +208,20 @@ class rvRTLhost():
             if addr not in bootrom_addrs and addr < DRAM_BASE:
                 mem_check = False
 
+        cov_total, module_covs = self.get_cov_stats()
+
         if not mem_check:
-            return (ILL_MEM, self.get_covsum())
+            return (ILL_MEM, cov_total, module_covs)
 
         if i == max_cycles - 1:
             self.debug_print('[RTLHost] Timeout, max_cycle={}'.format(max_cycles))
-            return (TIME_OUT, self.get_covsum())
+            return (TIME_OUT, cov_total, module_covs)
 
         if self.adapter.check_assert():
             self.debug_print('[RTLHost] Assertion Failure')
-            return (ASSERTION_FAIL, self.get_covsum())
+            return (ASSERTION_FAIL, cov_total, module_covs)
 
         self.save_signature(memory, sig_start, sig_end, data_addrs, self.rtl_sig_file)
         self.debug_print('[RTLHost] Stop RTL simulation')
 
-        return (SUCCESS, self.get_covsum())
+        return (SUCCESS, cov_total, module_covs)
