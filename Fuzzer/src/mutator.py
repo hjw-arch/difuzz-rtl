@@ -103,13 +103,15 @@ class rvMutator():
                  no_guide=False, target_module=None,
                  seed_scheduler='sgmu', target_rare_horizon=8,
                  target_max_energy=8, phase_policy='default',
-                 fuzzer_backend='difuzzrtl', target_cost_aware=False):
+                 fuzzer_backend='difuzzrtl', target_cost_aware=False,
+                 target_high_decay_window=0):
         self.corpus_size = corpus_size
         self.scheduled_corpus = ScheduledCorpus(
             mode=seed_scheduler,
             cap=corpus_size,
             rare_horizon=target_rare_horizon,
             max_energy=target_max_energy,
+            target_high_decay_window=target_high_decay_window,
             cost_aware=bool(target_cost_aware),
             rng=random,
         )

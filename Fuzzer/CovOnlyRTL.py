@@ -66,6 +66,9 @@ def _total_static_insts(sim_input) -> int:
 def _scheduler_needs_target_bits(seed_scheduler: str, target_module: str | None) -> bool:
     if not target_module:
         return False
+    if str(os.getenv("FORCE_TARGET_BITS", "0")).strip().lower() in {
+            "1", "true", "yes", "on"}:
+        return True
     mode = str(seed_scheduler or "").strip().lower().replace("-", "_")
     aliases = {
         "targetnew": "target_new",
@@ -105,7 +108,8 @@ def _append_status(path: str, row: list) -> None:
 def _setup_covonly(dut, toplevel, template, out, proc_num, debug,
                    no_guide, target_module, seed_scheduler,
                    target_rare_horizon, target_max_energy,
-                   phase_policy, fuzzer_backend, target_cost_aware):
+                   phase_policy, fuzzer_backend, target_cost_aware,
+                   target_high_decay_window):
     mutator = rvMutator(
         no_guide=bool(no_guide),
         target_module=target_module,
@@ -115,6 +119,7 @@ def _setup_covonly(dut, toplevel, template, out, proc_num, debug,
         phase_policy=phase_policy,
         fuzzer_backend=fuzzer_backend,
         target_cost_aware=bool(target_cost_aware),
+        target_high_decay_window=int(target_high_decay_window or 0),
     )
     preprocessor = rvPreProcessor(
         "riscv64-unknown-elf-gcc",
@@ -136,8 +141,9 @@ def RunCovOnly(dut, toplevel,
                target_rare_horizon=8, target_max_energy=8,
                phase_policy="default", fuzzer_backend="difuzzrtl",
                target_cost_aware=0,
+               target_high_decay_window=0,
                random_seed=0, cov_log=None, status_log=None,
-               start_time=0.0):
+               start_time=0.0, max_seconds=0):
     assert toplevel in ["RocketTile", "BoomTile"], \
         "{} is not toplevel".format(toplevel)
 
@@ -150,7 +156,8 @@ def RunCovOnly(dut, toplevel,
         dut, toplevel, template, out, proc_num, bool(debug),
         bool(no_guide), target_module, seed_scheduler,
         int(target_rare_horizon), int(target_max_energy),
-        phase_policy, fuzzer_backend, bool(int(target_cost_aware or 0)))
+        phase_policy, fuzzer_backend, bool(int(target_cost_aware or 0)),
+        int(target_high_decay_window or 0))
 
     module_cov_names = ensure_target_module(
         getattr(rtl_host, "module_cov_names", []),
@@ -162,8 +169,12 @@ def RunCovOnly(dut, toplevel,
     corpus_count = 0
     target_bits_enabled = _scheduler_needs_target_bits(
         seed_scheduler, target_module)
+    max_seconds = float(max_seconds or 0)
+    wall_start = float(start_time or time.time())
 
     for it in range(int(num_iter)):
+        if max_seconds > 0 and it > 0 and time.time() - wall_start >= max_seconds:
+            break
         iter_t0 = time.perf_counter()
         phase_at_get = getattr(mutator, "phase", "-")
         get_s = preprocess_s = rtl_s = post_s = 0.0
@@ -242,7 +253,7 @@ def RunCovOnly(dut, toplevel,
 
         mutator.observe_target_yield_result(
             target_new_bits,
-            admitted=add_for_target,
+            admitted=admitted,
             cost=int(getattr(rtl_host, "last_cycles", 0) or 0))
         mutator.update_phase(it)
 
@@ -303,11 +314,14 @@ parser.add_option("target_rare_horizon", 8, "SGMU rarity horizon")
 parser.add_option("target_max_energy", 8, "SGMU maximum mutation budget")
 parser.add_option("target_cost_aware", 0,
                   "Enable SGMU cost-aware value normalization")
+parser.add_option("target_high_decay_window", 0,
+                  "Target-high no-yield switch window; 0 disables it")
 parser.add_option("phase_policy", "default",
                   "Phase policy: default or mutation_only")
 parser.add_option("fuzzer_backend", "difuzzrtl",
                   "Fuzzer backend: difuzzrtl or isafuzz")
 parser.add_option("random_seed", 0, "Random seed, 0 means wall-clock seed")
+parser.add_option("max_seconds", 0.0, "Stop after this many wall-clock seconds")
 
 parser.print_help()
 parser.parse_option()

@@ -237,7 +237,8 @@ def Run(dut, toplevel,
             post_s = time.perf_counter() - t0
 
             t0 = time.perf_counter()
-            if coverage > last_coverage or add_for_target:
+            admitted_to_corpus = bool(coverage > last_coverage or add_for_target)
+            if admitted_to_corpus:
                 if multicore:
                     cNum = manager.read_num('cNum')
                     manager.write_num('cNum', cNum + 1)
@@ -262,7 +263,7 @@ def Run(dut, toplevel,
 
             t0 = time.perf_counter()
             mutator.observe_target_yield_result(
-                target_new_bits, admitted=add_for_target)
+                target_new_bits, admitted=admitted_to_corpus)
             observe_s = time.perf_counter() - t0
             t0 = time.perf_counter()
             mutator.update_phase(it)
