@@ -1,8 +1,10 @@
+import os
+
 import cocotb
 
 from cocotb.decorators import coroutine
 from cocotb.triggers import Timer, RisingEdge
-from reader.tile_reader import tileSrcReader
+from reader.tile_reader import infer_top_port_names, tileSrcReader
 from adapters.tile_adapter import tileAdapter
 from fuzzer.rtl_coverage import DutCoverageObserver
 
@@ -23,12 +25,14 @@ class rtlInput():
 
 class rvRTLhost():
     def __init__(self, dut, toplevel, rtl_sig_file, debug=False):
-        source_info = 'infos/' + toplevel + '_info.txt'
+        source_info = os.getenv(
+            "DIFUZZRTL_TILE_INFO",
+            'infos/' + toplevel + '_info.txt')
         reader = tileSrcReader(source_info)
 
         paths = reader.return_map()
 
-        port_names = paths['port_names']
+        port_names = infer_top_port_names(toplevel) or paths['port_names']
         monitor_pc = paths['monitor_pc']
         monitor_valid = paths['monitor_valid']
         monitor = (monitor_pc[0], monitor_valid[0])

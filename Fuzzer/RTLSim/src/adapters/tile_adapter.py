@@ -1,3 +1,4 @@
+import re
 import sys
 import cocotb
 
@@ -11,6 +12,16 @@ INT_MEIP = 0x4
 INT_SEIP = 0x8
 INT_MTIP = 0x1
 INT_MSIP = 0x2
+
+TL_PORT_RE = re.compile(r"_[abcde]_(?:ready|valid|bits(?:_|$))")
+
+
+def is_interrupt_port(name):
+    return (
+        name.startswith("auto_int_") or
+        "_int_in_" in name or
+        "_int_local_" in name
+    )
 
 class intPorts():
     __slots__ = ('seip', 'meip', 'msip', 'mtip')
@@ -28,11 +39,13 @@ class tileAdapter():
         tl_port_names = []
         int_port_names = []
         others = []
+        protocol = TL_UL
+        reset_vector_port = None
 
         for name in port_names:
-            if '_tl_' in name:
+            if TL_PORT_RE.search(name):
                 tl_port_names.append(name)
-            elif '_int' in name:
+            elif is_interrupt_port(name):
                 int_port_names.append(name)
             elif 'reset_vector' in name:
                 reset_vector_port = name
@@ -49,16 +62,30 @@ class tileAdapter():
         self.tl_adapter = tlAdapter(dut, tl_port_names, protocol, 64, debug)
 
         self.int_ports = intPorts()
+        self.int_handles = []
         for name in int_port_names:
-            if 'in_2_sync_0' in name: setattr(self.int_ports, 'seip', getattr(self.dut, name))
-            if 'in_1_sync_0' in name: setattr(self.int_ports, 'meip', getattr(self.dut, name))
-            if 'in_0_sync_0' in name: setattr(self.int_ports, 'msip', getattr(self.dut, name))
-            if 'in_0_sync_1' in name: setattr(self.int_ports, 'mtip', getattr(self.dut, name))
+            handle = getattr(self.dut, name)
+            self.int_handles.append(handle)
+            if re.search(r'in_2_(?:sync_)?0$', name):
+                setattr(self.int_ports, 'seip', handle)
+            if re.search(r'in_1_(?:sync_)?0$', name):
+                setattr(self.int_ports, 'meip', handle)
+            if re.search(r'in_0_(?:sync_)?0$', name):
+                setattr(self.int_ports, 'msip', handle)
+            if re.search(r'in_0_(?:sync_)?1$', name):
+                setattr(self.int_ports, 'mtip', handle)
+
+        if self.int_ports.mtip is None:
+            for name in int_port_names:
+                if re.search(r'in_1_(?:sync_)?1$', name):
+                    setattr(self.int_ports, 'mtip', getattr(self.dut, name))
+                    break
 
         self.reset_vector_port = getattr(self.dut, reset_vector_port)
 
         self.reset_vector = 0x10000
         self.reset_vector_port <= self.reset_vector
+        self.clear_interrupts()
 
         self.monitor_pc = getattr(self.dut, pc_name)
         self.monitor_valid = getattr(self.dut, valid_name)
@@ -69,9 +96,21 @@ class tileAdapter():
         if self.debug:
             print(message)
 
+    def clear_interrupts(self):
+        for handle in self.int_handles:
+            handle <= 0
+
     def assert_intr(self, intr):
         if intr == self.intr:
             return
+
+        missing = [
+            name for name in self.int_ports.__slots__
+            if getattr(self.int_ports, name) is None
+        ]
+        if missing:
+            raise Exception('Cannot assert interrupts; missing ports: {}'.format(
+                ', '.join(missing)))
 
         self.intr = intr
         meip = int((intr & INT_MEIP) == INT_MEIP)
@@ -125,9 +164,6 @@ class tileAdapter():
         while self.tl_adapter.isRunning():
             yield RisingEdge(self.dut.clock)
 
-        self.int_ports.seip <= 0
-        self.int_ports.meip <= 0
-        self.int_ports.msip <= 0
-        self.int_ports.mtip <= 0
+        self.clear_interrupts()
 
         self.intr = 0

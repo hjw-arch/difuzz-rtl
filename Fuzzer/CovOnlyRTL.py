@@ -28,7 +28,7 @@ from src.coverage_utils import (
     get_cov_module_names,
 )
 from src.env_parser import envParser
-from src.mutator import rvMutator
+from src.mutator import GENERATION, rvMutator
 from src.preprocessor import rvPreProcessor
 
 
@@ -79,6 +79,16 @@ def _scheduler_needs_target_bits(seed_scheduler: str, target_module: str | None)
     }
     mode = aliases.get(mode, mode)
     return mode in {"sgmu", "target_new"}
+
+
+def _is_generation_warmup(mutator: rvMutator, phase: int, it: int) -> bool:
+    warmup_iters = int(getattr(mutator, "corpus_size", 0) or 0) // 10
+    return (
+        phase == GENERATION
+        and getattr(mutator, "phase_policy", "default") == "default"
+        and not getattr(mutator, "no_guide", False)
+        and int(it) < warmup_iters
+    )
 
 
 def _status_header() -> str:
@@ -162,6 +172,8 @@ def RunCovOnly(dut, toplevel,
     module_cov_names = ensure_target_module(
         getattr(rtl_host, "module_cov_names", []),
         target_module)
+    rtl_host.coverage.set_module_cov_names(module_cov_names)
+    rtl_host.module_cov_names = rtl_host.coverage.module_cov_names
     last_module_covs = {name: 0 for name in module_cov_names}
     last_coverage = 0
     best_total_cov = 0
@@ -233,10 +245,11 @@ def RunCovOnly(dut, toplevel,
             if target_bits_enabled else set()
         target_new_bits = mutator.target_new_bits(target_hit_bits)
         add_for_target = bool(target_bits_enabled and target_new_bits)
+        add_for_warmup = _is_generation_warmup(mutator, phase_at_get, it)
         post_s = time.perf_counter() - t0
 
         admitted = False
-        if coverage > last_coverage or add_for_target:
+        if add_for_warmup or coverage > last_coverage or add_for_target:
             exec_cycles = int(getattr(rtl_host, "last_cycles", 0) or 0)
             if record:
                 sim_input.save(
