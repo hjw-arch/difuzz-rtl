@@ -402,8 +402,9 @@ private:
             addNode(NodeKind::Node, node.getName(), op, node.getResult());
           })
           .Case<firrtl::MemOp>([&](auto mem) {
-            addNode(NodeKind::Memory, mem.getName(), op,
-                    mem->getNumResults() ? mem->getResult(0) : Value{});
+            addNode(NodeKind::Memory, mem.getName(), op, {});
+            for (auto result : mem->getResults())
+              rootNames[result] = mem.getName().str();
           })
           .Case<firrtl::InstanceOp>([&](auto inst) {
             ++audit.instances;

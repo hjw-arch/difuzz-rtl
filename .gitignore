@@ -2,3 +2,10 @@ __pycache__
 .ccls-cache
 
 build
+
+# FIRRTL/sbt build products.  The checked-in sources are under firrtl/;
+# these generated directories and the assembled jar are local tool outputs.
+firrtl/target/
+firrtl/project/target/
+firrtl/project/project/target/
+firrtl/utils/bin/firrtl.jar
