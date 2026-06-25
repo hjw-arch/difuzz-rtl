@@ -223,7 +223,7 @@ class tileAdapter():
     @coroutine
     def stop(self):
         self.drive = False
-        max_wait = max(int(os.getenv('DIFUZZRTL_ADAPTER_STOP_MAX_CYCLES', '64')), 0)
+        max_wait = max(int(os.getenv('DIFUZZRTL_ADAPTER_STOP_MAX_CYCLES', '1000')), 0)
         waited = 0
         while self.tl_adapter.onGoing() and waited < max_wait:
             yield RisingEdge(self.dut.clock)
