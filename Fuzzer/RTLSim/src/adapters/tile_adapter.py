@@ -1,5 +1,6 @@
 import re
 import sys
+import os
 import cocotb
 
 from cocotb.decorators import coroutine
@@ -22,6 +23,68 @@ def is_interrupt_port(name):
         "_int_in_" in name or
         "_int_local_" in name
     )
+
+
+def _get_handle(parent, name):
+    try:
+        return getattr(parent, name)
+    except AttributeError:
+        pass
+    try:
+        return parent._id(name, extended=False)
+    except Exception:
+        pass
+    try:
+        return parent._id(name, extended=True)
+    except Exception:
+        return None
+
+
+def _verilator_escaped_name(name):
+    return name.replace("/", "__02f").replace(".", "__02e")
+
+
+def resolve_dut_handle(dut, name):
+    """Resolve a DUT handle across hierarchical and Yosys-flattened Verilog."""
+    top = getattr(dut, "_name", "")
+    flat_slash = name.replace(".", "/")
+    flat_dot = name.replace("/", ".")
+    candidates = [
+        name,
+        flat_slash,
+        flat_dot,
+        name.replace(".", "__DOT__").replace("/", "__DOT__"),
+        _verilator_escaped_name(flat_slash),
+    ]
+    if top:
+        candidates.append("{}__DOT__{}".format(
+            top, _verilator_escaped_name(flat_slash)))
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        handle = _get_handle(dut, candidate)
+        if handle is not None:
+            return handle
+
+    for sep in (".", "/"):
+        if sep not in name:
+            continue
+        handle = dut
+        ok = True
+        for part in name.split(sep):
+            handle = _get_handle(handle, part)
+            if handle is None:
+                ok = False
+                break
+        if ok:
+            return handle
+
+    raise AttributeError("{} contains no object named {}".format(
+        getattr(dut, "_name", dut), name))
+
 
 class intPorts():
     __slots__ = ('seip', 'meip', 'msip', 'mtip')
@@ -81,16 +144,17 @@ class tileAdapter():
                     setattr(self.int_ports, 'mtip', getattr(self.dut, name))
                     break
 
-        self.reset_vector_port = getattr(self.dut, reset_vector_port)
+        self.reset_vector_port = resolve_dut_handle(self.dut, reset_vector_port)
 
         self.reset_vector = 0x10000
         self.reset_vector_port <= self.reset_vector
         self.clear_interrupts()
 
-        self.monitor_pc = getattr(self.dut, pc_name)
-        self.monitor_valid = getattr(self.dut, valid_name)
+        self.monitor_pc = resolve_dut_handle(self.dut, pc_name)
+        self.monitor_valid = resolve_dut_handle(self.dut, valid_name)
 
         self.intr = 0
+        self.stop_forced = False
 
     def debug_print(self, message):
         if self.debug:
@@ -152,17 +216,26 @@ class tileAdapter():
             raise Exception('RocketTile Adapter must receive address map to drive DUT')
 
         self.drive = True
+        self.stop_forced = False
         self.tl_adapter.start(memory)
         self.intr_handler = cocotb.fork(self.interrupt_handler(ints))
 
     @coroutine
     def stop(self):
         self.drive = False
-        while self.tl_adapter.onGoing():
+        max_wait = max(int(os.getenv('DIFUZZRTL_ADAPTER_STOP_MAX_CYCLES', '64')), 0)
+        waited = 0
+        while self.tl_adapter.onGoing() and waited < max_wait:
             yield RisingEdge(self.dut.clock)
+            waited += 1
         self.tl_adapter.stop()
-        while self.tl_adapter.isRunning():
+        waited = 0
+        while self.tl_adapter.isRunning() and waited < max_wait:
             yield RisingEdge(self.dut.clock)
+            waited += 1
+        if self.tl_adapter.isRunning():
+            self.stop_forced = True
+            self.tl_adapter.force_stop()
 
         self.clear_interrupts()
 

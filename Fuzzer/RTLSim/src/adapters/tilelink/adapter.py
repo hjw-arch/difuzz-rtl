@@ -752,6 +752,15 @@ class tlAdapter():
     def stop(self):
         self.retrieve = True
 
+    def force_stop(self):
+        self.retrieve = True
+        self.drive = False
+        self.probe = 0
+        self.probe_en = 0
+        self.probe_addr = 0
+        self.b_queue.clear()
+        self.d_queue.clear()
+
     def onGoing(self):
         return self.a_ports.valid.value | self.c_ports.valid.value
 

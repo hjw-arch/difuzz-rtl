@@ -14,9 +14,14 @@ class rvPreProcessor():
                                   os.getenv('ELF2HEX', elf2hex))
         self.march = os.getenv('RISCV_MARCH', 'rv64imafd')
         self.mabi = os.getenv('RISCV_MABI', 'lp64')
+        self.nm = os.getenv(
+            'RISCV_NM',
+            self.cc[:-len('gcc')] + 'nm' if self.cc.endswith('gcc')
+            else 'riscv64-unknown-elf-nm')
         self.template = template
         self.base = out_base
         self.proc_num = proc_num
+        self.template_cache = {}
 
         self.er_num = 0
         self.cc_args = [
@@ -30,23 +35,33 @@ class rvPreProcessor():
 
         self.elf2hex_args = [ self.elf2hex, '--bit-width', '64', '--input' ]
 
-    def get_symbols(self, elf_name, sym_name):
-        # symbol_file = self.base + '/.input.symbols'
-        fd = open(sym_name, 'w')
-        subprocess.call([ 'nm', elf_name], stdout=fd )
-        fd.close()
-
+    def get_symbols(self, elf_name, sym_name=None):
+        result = subprocess.run(
+            [self.nm, elf_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
         symbols = {}
-        fd = open(sym_name, 'r')
-        lines = fd.readlines()
-        fd.close()
-
-        for line in lines:
-            symbol = line.split(' ')[2]
-            addr = line.split(' ')[0]
-            symbols[symbol[:-1]] = int(addr, 16)
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            addr, symbol = parts[0], parts[2]
+            try:
+                symbols[symbol] = int(addr, 16)
+            except ValueError:
+                continue
 
         return symbols
+
+    def template_lines(self, template_name):
+        lines = self.template_cache.get(template_name)
+        if lines is None:
+            with open(template_name, 'r') as fd:
+                lines = fd.readlines()
+            self.template_cache[template_name] = lines
+        return lines
 
     def write_isa_intr(self, isa_input, rtl_input, epc):
         fd = open(rtl_input.intrfile, 'r')
@@ -61,7 +76,8 @@ class rvPreProcessor():
         fd.write('{:016x}:{:04b}\n'.format(epc, val))
         fd.close()
 
-    def process(self, sim_input: simInput, data: list, intr: bool, num_data_sections=6):
+    def process(self, sim_input: simInput, data: list, intr: bool,
+                num_data_sections=6, write_sim_input=True):
         section_size = len(data) // num_data_sections
 
         assert data, 'Empty data can not be processed'
@@ -103,14 +119,11 @@ class rvPreProcessor():
             else:
                 ints.append(INT)
 
-        sim_input.save(si_name, data)
-
-        fd = open(test_template, 'r')
-        template_lines = fd.readlines()
-        fd.close()
+        if write_sim_input:
+            sim_input.save(si_name, data)
 
         assembly = []
-        for line in template_lines:
+        for line in self.template_lines(test_template):
             assembly.append(line)
             if '_fuzz_prefix:' in line:
                 for inst in prefix_insts:
@@ -152,7 +165,8 @@ class rvPreProcessor():
 
         if cc_ret == 0:
             elf2hex_args = self.elf2hex_args + [ elf_name, '--output', hex_name]
-            subprocess.call(elf2hex_args)
+            if subprocess.call(elf2hex_args) != 0 or not os.path.isfile(hex_name):
+                return (None, None, None)
             symbols= self.get_symbols(elf_name, sym_name)
 
             if intr:
@@ -163,9 +177,9 @@ class rvPreProcessor():
                         fd.write('{:016x}:{:04b}\n'.format(fuzz_main + 4 * i, INT))
                 fd.close()
 
-            max_cycles = 6000
+            max_cycles = int(os.getenv('DIFUZZRTL_MAX_CYCLES', '6000'))
             if version in [ V_U ]:
-                max_cycles = 200000
+                max_cycles = int(os.getenv('DIFUZZRTL_VECTOR_MAX_CYCLES', '200000'))
 
             isa_input = isaInput(elf_name, isa_intr_name, symbols, data)
             rtl_input = rtlInput(hex_name, rtl_intr_name, data, symbols, max_cycles)

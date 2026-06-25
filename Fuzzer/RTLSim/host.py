@@ -6,7 +6,7 @@ from cocotb.decorators import coroutine
 from cocotb.triggers import Timer, RisingEdge
 from reader.tile_reader import infer_top_port_names, tileSrcReader
 from adapters.tile_adapter import tileAdapter
-from fuzzer.rtl_coverage import DutCoverageObserver
+from fuzzer.rtl_coverage import DutCoverageObserver, DutDtGroupObserver
 
 SUCCESS = 0
 ASSERTION_FAIL = 1
@@ -24,7 +24,10 @@ class rtlInput():
         self.max_cycles = max_cycles
 
 class rvRTLhost():
-    def __init__(self, dut, toplevel, rtl_sig_file, debug=False):
+    def __init__(self, dut, toplevel, rtl_sig_file, debug=False,
+                 dt_group_json=None, dt_group_pair_id=None,
+                 dt_group_feedback_io="auto", dt_group_feedback_bits=False,
+                 dt_group_internal_weight=1):
         source_info = os.getenv(
             "DIFUZZRTL_TILE_INFO",
             'infos/' + toplevel + '_info.txt')
@@ -44,10 +47,20 @@ class rvRTLhost():
         self.adapter = tileAdapter(dut, port_names, monitor, self.debug)
         self.toplevel = toplevel
         self.coverage = DutCoverageObserver(dut, toplevel)
+        self.dt_group = DutDtGroupObserver(
+            self.coverage,
+            dt_group_json,
+            pair_id=dt_group_pair_id,
+            feedback_io=dt_group_feedback_io,
+            feedback_bits=bool(dt_group_feedback_bits),
+            internal_weight=int(dt_group_internal_weight or 1),
+        )
         self.module_cov_names = self.coverage.module_cov_names
         self.last_target_cov_hits = set()
         self.last_target_cov_module = None
         self.last_target_handle_count = 0
+        self.last_dt_group_observation = None
+        self.last_dt_group_handle_count = 0
         self.last_cycles = 0
 
     def debug_print(self, message):
@@ -128,6 +141,8 @@ class rvRTLhost():
         self.last_target_cov_hits = set()
         self.last_target_cov_module = target_bitmap_module
         self.last_target_handle_count = 0
+        self.last_dt_group_observation = None
+        self.last_dt_group_handle_count = 0
         self.last_cycles = 0
 
         fd = open(rtl_input.hexfile, 'r')
@@ -183,6 +198,8 @@ class rvRTLhost():
         self.last_target_handle_count = len(target_cov_trace_handles)
         target_bitmap_sample_period = max(
             int(target_bitmap_sample_period or 1), 1)
+        self.dt_group.reset()
+        self.last_dt_group_handle_count = self.dt_group.handle_count
 
         yield self.reset(clk, self.dut.metaReset, self.dut.reset)
 
@@ -194,6 +211,8 @@ class rvRTLhost():
                 self.coverage.sample_tagged_handles(
                     target_cov_trace_handles,
                     self.last_target_cov_hits)
+            if self.dt_group.enabled and i % target_bitmap_sample_period == 0:
+                self.dt_group.sample()
 
             if i % 100 == 0:
                 tohost = memory[tohost_addr]
@@ -204,7 +223,12 @@ class rvRTLhost():
         self.last_cycles = i + 1
 
         yield self.adapter.stop()
+        adapter_stop_forced = bool(getattr(self.adapter, 'stop_forced', False))
         clk_driver.kill()
+        self.last_dt_group_observation = self.dt_group.observe()
+        if self.last_dt_group_observation is not None:
+            self.last_target_cov_hits.update(
+                self.last_dt_group_observation.feedback_targets)
 
         # Check all the CPU's memory access operations occurs in DRAM
         mem_check = True
@@ -217,7 +241,7 @@ class rvRTLhost():
         if not mem_check:
             return (ILL_MEM, cov_total, module_covs)
 
-        if i == max_cycles - 1:
+        if i == max_cycles - 1 or adapter_stop_forced:
             self.debug_print('[RTLHost] Timeout, max_cycle={}'.format(max_cycles))
             return (TIME_OUT, cov_total, module_covs)
 

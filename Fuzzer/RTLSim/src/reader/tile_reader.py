@@ -67,11 +67,17 @@ def _read_module_port_text(vfile, top_name):
                 match = MODULE_RE.match(line)
                 if match and match.group(1) == top_name:
                     in_module = True
-                    chunks.append(line[line.find("(") + 1:])
+                    chunk = line[line.find("(") + 1:]
+                    depth = 1 + chunk.count("(") - chunk.count(")")
+                    if depth <= 0:
+                        return chunk.rsplit(")", 1)[0]
+                    chunks.append(chunk)
                 continue
-            chunks.append(line)
-            if line.strip() == ");":
+            depth += line.count("(") - line.count(")")
+            if depth <= 0:
+                chunks.append(line.rsplit(")", 1)[0])
                 break
+            chunks.append(line)
     return "".join(chunks) if chunks else ""
 
 
@@ -92,11 +98,9 @@ def infer_top_port_names(top_name):
             chunk = chunk.strip()
             if not chunk:
                 continue
-            if chunk.endswith(");"):
-                chunk = chunk[:-2].strip()
             tokens = IDENT_RE.findall(chunk)
             tokens = [tok for tok in tokens if tok not in VERILOG_KEYWORDS]
-            if tokens:
+            if tokens and tokens[-1] not in names:
                 names.append(tokens[-1])
         if names:
             return names

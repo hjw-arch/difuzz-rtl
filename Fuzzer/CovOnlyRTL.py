@@ -63,8 +63,11 @@ def _total_static_insts(sim_input) -> int:
     )
 
 
-def _scheduler_needs_target_bits(seed_scheduler: str, target_module: str | None) -> bool:
-    if not target_module:
+def _scheduler_needs_target_bits(
+        seed_scheduler: str,
+        target_module: str | None,
+        dt_group_json: str | None = None) -> bool:
+    if not target_module and not dt_group_json:
         return False
     if str(os.getenv("FORCE_TARGET_BITS", "0")).strip().lower() in {
             "1", "true", "yes", "on"}:
@@ -79,6 +82,26 @@ def _scheduler_needs_target_bits(seed_scheduler: str, target_module: str | None)
     }
     mode = aliases.get(mode, mode)
     return mode in {"sgmu", "target_new"}
+
+
+def _dt_group_summary(rtl_host) -> dict:
+    observation = getattr(rtl_host, "last_dt_group_observation", None)
+    if observation is None:
+        return {
+            "feedback": 0,
+            "states": 0,
+            "metadata": 0,
+            "missing_ports": "",
+            "target_score": 0,
+        }
+    return {
+        "feedback": len(getattr(observation, "feedback_targets", ()) or ()),
+        "states": len(getattr(observation, "monitor_states", ()) or ()),
+        "metadata": len(getattr(observation, "metadata_states", ()) or ()),
+        "missing_ports": ",".join(sorted(
+            getattr(observation, "missing_ports", ()) or ())),
+        "target_score": int(getattr(observation, "target_score", 0) or 0),
+    }
 
 
 def _is_generation_warmup(mutator: rvMutator, phase: int, it: int) -> bool:
@@ -96,6 +119,8 @@ def _status_header() -> str:
         "iter", "phase", "status", "coverage", "target_cov",
         "best_target_cov", "best_total_cov", "target_bits_enabled",
         "target_handles", "rtl_cycles", "target_hits", "target_new",
+        "dtg_handles", "dtg_feedback", "dtg_states", "dtg_metadata",
+        "dtg_missing_ports", "dtg_target_score",
         "admitted", "corpus", "main_words", "total_static_insts", "get_s",
         "preprocess_s", "rtl_s", "post_s", "total_s",
         "parent_seed_id", "parent_main_words", "parent_static_insts",
@@ -115,11 +140,19 @@ def _append_status(path: str, row: list) -> None:
     _write(path, "\t".join(values) + "\n")
 
 
+def _progress(message: str) -> None:
+    if str(os.getenv("COVONLY_PROGRESS", "0")).strip().lower() in {
+            "1", "true", "yes", "on"}:
+        print("[CovOnlyRTL] {}".format(message), flush=True)
+
+
 def _setup_covonly(dut, toplevel, template, out, proc_num, debug,
                    no_guide, target_module, seed_scheduler,
                    target_rare_horizon, target_max_energy,
                    phase_policy, fuzzer_backend, target_cost_aware,
-                   target_high_decay_window):
+                   target_high_decay_window, dt_group_json,
+                   dt_group_pair_id, dt_group_feedback_io,
+                   dt_group_feedback_bits, dt_group_internal_weight):
     mutator = rvMutator(
         no_guide=bool(no_guide),
         target_module=target_module,
@@ -139,7 +172,14 @@ def _setup_covonly(dut, toplevel, template, out, proc_num, debug,
         proc_num,
     )
     rtl_sigfile = os.path.join(out, ".rtl_sig_{}.txt".format(proc_num))
-    rtl_host = rvRTLhost(dut, toplevel, rtl_sigfile, debug=bool(debug))
+    rtl_host = rvRTLhost(
+        dut, toplevel, rtl_sigfile, debug=bool(debug),
+        dt_group_json=dt_group_json,
+        dt_group_pair_id=dt_group_pair_id,
+        dt_group_feedback_io=dt_group_feedback_io,
+        dt_group_feedback_bits=bool(int(dt_group_feedback_bits or 0)),
+        dt_group_internal_weight=int(dt_group_internal_weight or 1),
+    )
     return mutator, preprocessor, rtl_host
 
 
@@ -152,6 +192,9 @@ def RunCovOnly(dut, toplevel,
                phase_policy="default", fuzzer_backend="difuzzrtl",
                target_cost_aware=0,
                target_high_decay_window=0,
+               dt_group_json=None, dt_group_pair_id=None,
+               dt_group_feedback_io="auto", dt_group_feedback_bits=0,
+               dt_group_internal_weight=1,
                random_seed=0, cov_log=None, status_log=None,
                start_time=0.0, max_seconds=0):
     assert toplevel in ["RocketTile", "BoomTile"], \
@@ -167,7 +210,9 @@ def RunCovOnly(dut, toplevel,
         bool(no_guide), target_module, seed_scheduler,
         int(target_rare_horizon), int(target_max_energy),
         phase_policy, fuzzer_backend, bool(int(target_cost_aware or 0)),
-        int(target_high_decay_window or 0))
+        int(target_high_decay_window or 0), dt_group_json,
+        dt_group_pair_id, dt_group_feedback_io,
+        int(dt_group_feedback_bits or 0), int(dt_group_internal_weight or 1))
 
     module_cov_names = ensure_target_module(
         getattr(rtl_host, "module_cov_names", []),
@@ -180,13 +225,14 @@ def RunCovOnly(dut, toplevel,
     best_target_cov = 0
     corpus_count = 0
     target_bits_enabled = _scheduler_needs_target_bits(
-        seed_scheduler, target_module)
+        seed_scheduler, target_module, dt_group_json)
     max_seconds = float(max_seconds or 0)
     wall_start = float(start_time or time.time())
 
     for it in range(int(num_iter)):
         if max_seconds > 0 and it > 0 and time.time() - wall_start >= max_seconds:
             break
+        _progress("iter {} begin".format(it))
         iter_t0 = time.perf_counter()
         phase_at_get = getattr(mutator, "phase", "-")
         get_s = preprocess_s = rtl_s = post_s = 0.0
@@ -195,11 +241,15 @@ def RunCovOnly(dut, toplevel,
         sim_input, data = mutator.get(False)
         get_s = time.perf_counter() - t0
         total_static = _total_static_insts(sim_input)
+        _progress("iter {} generated words={} static_insts={} get_s={:.3f}".format(
+            it, sim_input.num_words, total_static, get_s))
 
         t0 = time.perf_counter()
         isa_input, rtl_input, _symbols = preprocessor.process(
-            sim_input, data, False)
+            sim_input, data, False, write_sim_input=bool(record))
         preprocess_s = time.perf_counter() - t0
+        _progress("iter {} preprocessed ok={} preprocess_s={:.3f}".format(
+            it, bool(isa_input and rtl_input), preprocess_s))
 
         if not isa_input or not rtl_input:
             mutator.observe_target_yield_result(set(), admitted=False)
@@ -209,7 +259,8 @@ def RunCovOnly(dut, toplevel,
                 _append_status(status_log, [
                     it, phase_at_get, "compile_fail", last_coverage, 0,
                     best_target_cov, best_total_cov,
-                    int(target_bits_enabled), 0, 0, 0, 0, 0,
+                    int(target_bits_enabled), 0, 0, 0, 0,
+                    0, 0, 0, 0, "", 0, 0,
                     len(mutator.corpus), sim_input.num_words, total_static,
                     get_s, preprocess_s, rtl_s, post_s,
                     time.perf_counter() - iter_t0,
@@ -227,6 +278,8 @@ def RunCovOnly(dut, toplevel,
             continue
 
         t0 = time.perf_counter()
+        _progress("iter {} rtl begin max_cycles={}".format(
+            it, getattr(rtl_input, "max_cycles", "?")))
         result = yield rtl_host.run_test(
             rtl_input,
             False,
@@ -234,6 +287,8 @@ def RunCovOnly(dut, toplevel,
             target_bitmap_sample_period=target_bitmap_sample_period,
         )
         rtl_s = time.perf_counter() - t0
+        _progress("iter {} rtl done result={} rtl_s={:.3f}".format(
+            it, result, rtl_s))
         if len(result) == 3:
             ret, coverage, module_covs = result
         else:
@@ -285,6 +340,7 @@ def RunCovOnly(dut, toplevel,
         if status_log:
             target_cov = int(module_covs.get(target_module, 0) or 0) \
                 if target_module else 0
+            dtg = _dt_group_summary(rtl_host)
             best_target_cov = max(best_target_cov, target_cov)
             best_total_cov = max(best_total_cov, int(coverage or 0))
             selection = mutator.get_last_selection_summary()
@@ -293,7 +349,11 @@ def RunCovOnly(dut, toplevel,
                 best_target_cov, best_total_cov, int(target_bits_enabled),
                 int(getattr(rtl_host, "last_target_handle_count", 0) or 0),
                 int(getattr(rtl_host, "last_cycles", 0) or 0),
-                len(target_hit_bits), len(target_new_bits), int(admitted),
+                len(target_hit_bits), len(target_new_bits),
+                int(getattr(rtl_host, "last_dt_group_handle_count", 0) or 0),
+                dtg["feedback"], dtg["states"], dtg["metadata"],
+                dtg["missing_ports"], dtg["target_score"],
+                int(admitted),
                 len(mutator.corpus), sim_input.num_words, total_static, get_s,
                 preprocess_s, rtl_s, post_s,
                 time.perf_counter() - iter_t0,
@@ -333,6 +393,14 @@ parser.add_option("phase_policy", "default",
                   "Phase policy: default or mutation_only")
 parser.add_option("fuzzer_backend", "difuzzrtl",
                   "Fuzzer backend: difuzzrtl or isafuzz")
+parser.add_option("dt_group_json", None, "DeltaRTL DT Group json")
+parser.add_option("dt_group_pair_id", None, "DT Group pair id")
+parser.add_option("dt_group_feedback_io", "auto",
+                  "DT Group input/output feedback: auto, never, always")
+parser.add_option("dt_group_feedback_bits", 0,
+                  "Enable per-bit DT Group feedback targets")
+parser.add_option("dt_group_internal_weight", 1,
+                  "Integer weight for DT Group internal feedback")
 parser.add_option("random_seed", 0, "Random seed, 0 means wall-clock seed")
 parser.add_option("max_seconds", 0.0, "Stop after this many wall-clock seconds")
 
