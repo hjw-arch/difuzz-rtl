@@ -38,17 +38,21 @@ Implemented pass entry points:
   `covSum`, `io_covSum` output port, `metaAssert` output port, `metaReset`
   input port, per-direct-child `*_halt` inputs, child-instance `io_covSum`
   aggregation, and child-instance `metaReset = metaReset | child_halt` wiring
-  on all non-external modules.
-* The local state packing follows the legacy `InstrCov` object selection:
-  small useful control registers are packed directly, vector registers share
-  offsets across elements, and uncovered mux-condition signals are represented
-  as one-bit state contributors.  State width is capped at 20 bits and
-  `covSum` arithmetic is truncated back to 30 bits to preserve the old overflow
-  behavior.
-* `metaReset` wraps the module's original registers and the inserted coverage
-  state, `covSum`, and sticky module-local `metaAssert` register, matching the
-  legacy `InstrReset` behavior used by the fuzzer runtime.  `metaAssert` is
-  the OR of local stop conditions and direct child `metaAssert` outputs.
+  on all non-external modules.  By default it does not export hierarchical
+  `io_state` ports, so the original cocotb/VPI DifuzzRTL path keeps the same
+  structural surface.
+* The local state packing is selectable with `state-plan`.
+  `compressed` is the default: small useful control registers are packed
+  directly, vector registers share offsets across elements, and uncovered
+  mux-condition signals are represented as one-bit state contributors.
+  `legacy-like` keeps all small control registers in the state hash and avoids
+  the vector/mux-condition compression.  State width is capped at 20 bits in
+  both modes and `covSum` arithmetic is truncated back to 30 bits.
+* `metaReset` wraps the module's original registers and sticky module-local
+  `metaAssert` register.  It deliberately does not clear the inserted coverage
+  state, coverage bitmap, or `covSum`, because the fuzzer observes cumulative
+  coverage across per-test meta resets.  `metaAssert` is the OR of local stop
+  conditions and direct child `metaAssert` outputs.
 
 Version-boundary rule:
 
@@ -86,6 +90,34 @@ firtool input.fir \
   --low-firrtl-pass-plugin='firrtl.circuit(difuzzrtl-modern-regcoverage-audit)' \
   --disable-output
 ```
+
+The default state plan is `compressed`.  To use the higher-entropy
+DifuzzRTL-alignment plan:
+
+```sh
+firtool input.fir \
+  --load-pass-plugin=/tmp/difuzzrtl-modern-regcov-build/libDifuzzRTLModernRegCoverage.so \
+  --low-firrtl-pass-plugin='firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{state-plan=legacy-like})' \
+  --verilog -o regcov.v
+```
+
+DiffTest coverage feedback uses the same coverage state values, but transports
+them through top-level RTL ports instead of Verilator hierarchy access.  Enable
+that path explicitly:
+
+```sh
+firtool input.fir \
+  --load-pass-plugin=/tmp/difuzzrtl-modern-regcov-build/libDifuzzRTLModernRegCoverage.so \
+  --low-firrtl-pass-plugin='firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{state-plan=legacy-like export-state=true state-map-file=/tmp/regcoverage_state_map.json})' \
+  --verilog -o regcov_difftest.v
+```
+
+`state-map-file` records the stable mapping from each `io_state` slot to the
+module instance path.  ISAFuzz uses that map for `--target-module`, so instance
+subtree targeting stays aligned with the legacy DifuzzRTL idea of collecting
+coverage handles from the target subtree.  If coverage feedback is not needed,
+omit `export-state` and `state-map-file`; `io_state` is not generated or
+aggregated.
 
 Smoke test:
 
