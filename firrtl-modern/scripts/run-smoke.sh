@@ -75,7 +75,7 @@ grep -q '%Top_state = firrtl.reg' "${TMP_DIR}/simple-covsum.mlir"
 grep -q '%Top_cov_read, %Top_cov_write = firrtl.mem' "${TMP_DIR}/simple-covsum.mlir"
 grep -q '%Top_covSum = firrtl.reg' "${TMP_DIR}/simple-covsum.mlir"
 if grep -q 'io_state' "${TMP_DIR}/simple-covsum.mlir"; then
-  echo "io_state must not be emitted without export-state" >&2
+  echo "io_state must not be emitted by regCoverage" >&2
   exit 1
 fi
 python3 - "${TMP_DIR}/simple-covsum.mlir" <<'PY'
@@ -104,27 +104,6 @@ if not re.search(r"firrtl\.strictconnect %metaAssert, %c0_ui1", text):
     raise SystemExit("empty metaAssert must be tied to constant zero")
 PY
 grep -q 'firrtl.strictconnect %io_covSum, %Top_covSum' "${TMP_DIR}/simple-covsum.mlir"
-
-STATE_MAP="${TMP_DIR}/simple-state-map.json"
-"${FIRTOOL}" "${ROOT_DIR}/tests/simple.fir" \
-  --mlir-print-op-on-diagnostic=false \
-  --load-pass-plugin="${PLUGIN}" \
-  --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{export-state=true state-map-file=${STATE_MAP}})" \
-  --ir-fir >"${TMP_DIR}/simple-covsum-state.mlir" 2>&1
-grep -q 'out %io_state: !firrtl.uint<20>' "${TMP_DIR}/simple-covsum-state.mlir"
-python3 - "${STATE_MAP}" <<'PY'
-from __future__ import annotations
-
-import json
-import sys
-from pathlib import Path
-
-data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-top = data["roots"]["Top"]
-assert data["kind"] == "difuzzrtl_regcoverage_state_map_v0"
-assert data["slot_bits"] == 20
-assert top == [{"slot": 0, "module": "Top", "path": "Top"}]
-PY
 
 "${FIRTOOL}" "${ROOT_DIR}/tests/stop.fir" \
   --mlir-print-op-on-diagnostic=false \

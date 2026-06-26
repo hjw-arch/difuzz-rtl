@@ -24,7 +24,6 @@
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cctype>
-#include <fstream>
 #include <map>
 #include <optional>
 #include <set>
@@ -144,43 +143,22 @@ struct CircuitAudit {
   }
 };
 
-struct ChildInstanceInfo {
-  std::string name;
-  unsigned moduleIndex = 0;
-};
-
 struct ModuleCovSumInfo {
   firrtl::FModuleOp module;
   unsigned oldPortCount = 0;
   unsigned covSumPortIndex = 0;
-  unsigned statePortIndex = 0;
   unsigned metaAssertPortIndex = 0;
   unsigned metaResetPortIndex = 0;
-  unsigned stateSlots = 0;
   ModuleAudit audit;
   CoveragePlan plan;
   SmallVector<Value> originalRegs;
-  SmallVector<ChildInstanceInfo> childInstances;
   SmallVector<Value> childCovSums;
-  SmallVector<Value> childStates;
   SmallVector<std::pair<std::string, Value>> childMetaResets;
   SmallVector<Value> childMetaAsserts;
   SmallVector<Value> childInternalHalts;
   SmallVector<std::pair<unsigned, firrtl::PortInfo>> insertedPorts;
   Value localCovSum;
-  Value localState;
   Value localMetaAssert;
-};
-
-struct LocalCoverageSignals {
-  Value covSum;
-  Value state;
-};
-
-struct StateSlotEntry {
-  unsigned slot = 0;
-  std::string module;
-  std::string path;
 };
 
 static firrtl::UIntType getUInt(MLIRContext *ctx, unsigned width) {
@@ -274,35 +252,6 @@ static Value truncateToUInt30(OpBuilder &builder, Location loc, Value value) {
   return builder.create<firrtl::BitsPrimOp>(loc, getUInt(builder.getContext(), 30),
                                             value, 29, 0)
       .getResult();
-}
-
-static constexpr unsigned kRegCoverageStateSlotBits = 20;
-
-static Value zeroStateSlot(OpBuilder &builder, Location loc) {
-  return constantUInt(builder, loc, kRegCoverageStateSlotBits, 0);
-}
-
-static Value padToStateSlot(OpBuilder &builder, Location loc, Value value,
-                            unsigned width) {
-  if (!value || width == 0)
-    return zeroStateSlot(builder, loc);
-  if (width == kRegCoverageStateSlotBits)
-    return value;
-  return builder
-      .create<firrtl::PadPrimOp>(
-          loc, getUInt(builder.getContext(), kRegCoverageStateSlotBits), value,
-          kRegCoverageStateSlotBits)
-      .getResult();
-}
-
-static Value catUInts(OpBuilder &builder, Location loc,
-                      ArrayRef<Value> values) {
-  if (values.empty())
-    return {};
-  Value out = values.front();
-  for (auto value : values.drop_front())
-    out = builder.create<firrtl::CatPrimOp>(loc, value, out).getResult();
-  return out;
 }
 
 static firrtl::BundleType coverageReadPortType(MLIRContext *ctx,
@@ -1065,19 +1014,18 @@ static Value buildStateExpression(OpBuilder &builder, Location loc,
   return paddedItems.front();
 }
 
-static LocalCoverageSignals insertLocalCoverage(firrtl::FModuleOp module,
-                                                const CoveragePlan &plan) {
+static Value insertLocalCoverage(firrtl::FModuleOp module,
+                                 const CoveragePlan &plan) {
   OpBuilder builder = module.getBodyBuilder();
   auto loc = module.getLoc();
   auto *ctx = module.getContext();
   auto covSumType = getUInt(ctx, 30);
   auto moduleName = module.getName();
   auto zeroCovSum = constantUInt(builder, loc, 30, 0);
-  auto zeroState = zeroStateSlot(builder, loc);
 
   Value clock = findClock(module);
   if (plan.regStateSize == 0 || !clock)
-    return {zeroCovSum, zeroState};
+    return zeroCovSum;
 
   auto stateType = getUInt(ctx, plan.regStateSize);
   auto oneBit = getUInt(ctx, 1);
@@ -1143,8 +1091,7 @@ static LocalCoverageSignals insertLocalCoverage(firrtl::FModuleOp module,
                                           nextCovSum.getResult());
 
   (void)oneBit;
-  return {covSumReg.getResult(),
-          padToStateSlot(builder, loc, stateReg.getResult(), plan.regStateSize)};
+  return covSumReg.getResult();
 }
 
 static Value orReduce(OpBuilder &builder, Location loc, ArrayRef<Value> values) {
@@ -1245,115 +1192,6 @@ static void applyMetaResetToRegs(firrtl::FModuleOp module, Value metaReset,
   }
 }
 
-static FailureOr<unsigned>
-computeStateSlots(unsigned index, MutableArrayRef<ModuleCovSumInfo> infos,
-                  llvm::DenseSet<unsigned> &active) {
-  auto &info = infos[index];
-  if (info.stateSlots)
-    return info.stateSlots;
-  if (active.contains(index))
-    return info.module.emitError()
-           << "recursive module instantiation is not supported by regCoverage";
-
-  active.insert(index);
-  unsigned slots = info.plan.regStateSize ? 1 : 0;
-  for (auto &child : info.childInstances) {
-    auto childSlots = computeStateSlots(child.moduleIndex, infos, active);
-    if (failed(childSlots))
-      return failure();
-    slots += *childSlots;
-  }
-  active.erase(index);
-  info.stateSlots = slots;
-  return slots;
-}
-
-static void appendStateSlotEntries(unsigned index,
-                                   MutableArrayRef<ModuleCovSumInfo> infos,
-                                   StringRef path, unsigned &slot,
-                                   SmallVectorImpl<StateSlotEntry> &entries) {
-  auto &info = infos[index];
-  if (info.plan.regStateSize)
-    entries.push_back(StateSlotEntry{slot++, info.module.getName().str(),
-                                     path.str()});
-  for (auto &child : info.childInstances) {
-    std::string childPath = (path + "." + child.name).str();
-    appendStateSlotEntries(child.moduleIndex, infos, childPath, slot, entries);
-  }
-}
-
-static std::string jsonEscape(StringRef text) {
-  std::string out;
-  for (char c : text) {
-    if (c == '"' || c == '\\') {
-      out.push_back('\\');
-      out.push_back(c);
-    } else if (c == '\n') {
-      out += "\\n";
-    } else {
-      out.push_back(c);
-    }
-  }
-  return out;
-}
-
-static LogicalResult writeStateMap(StringRef path,
-                                   MutableArrayRef<ModuleCovSumInfo> infos) {
-  if (path.empty())
-    return success();
-
-  llvm::DenseSet<unsigned> hasParent;
-  for (auto &info : infos)
-    for (auto &child : info.childInstances)
-      hasParent.insert(child.moduleIndex);
-
-  std::ofstream os(path.str());
-  if (!os) {
-    if (infos.empty())
-      return failure();
-    return infos.front().module.emitError()
-           << "cannot open regCoverage state map `" << path << "`";
-  }
-
-  os << "{\n"
-     << "  \"kind\":\"difuzzrtl_regcoverage_state_map_v0\",\n"
-     << "  \"slot_bits\":" << kRegCoverageStateSlotBits << ",\n"
-     << "  \"roots\":{\n";
-
-  bool firstRoot = true;
-  for (unsigned i = 0, e = infos.size(); i < e; ++i) {
-    if (hasParent.contains(i) || infos[i].stateSlots == 0)
-      continue;
-    SmallVector<StateSlotEntry> entries;
-    unsigned slot = 0;
-    appendStateSlotEntries(i, infos, infos[i].module.getName(), slot, entries);
-
-    if (!firstRoot)
-      os << ",\n";
-    firstRoot = false;
-    os << "    \"" << jsonEscape(infos[i].module.getName()) << "\":[\n";
-    for (unsigned j = 0, n = entries.size(); j < n; ++j) {
-      auto &entry = entries[j];
-      os << "      {\"slot\":" << entry.slot
-         << ",\"module\":\"" << jsonEscape(entry.module)
-         << "\",\"path\":\"" << jsonEscape(entry.path) << "\"}";
-      if (j + 1 != n)
-        os << ",";
-      os << "\n";
-    }
-    os << "    ]";
-  }
-
-  os << "\n  }\n}\n";
-  if (!os) {
-    if (infos.empty())
-      return failure();
-    return infos.front().module.emitError()
-           << "failed to write regCoverage state map `" << path << "`";
-  }
-  return success();
-}
-
 class ModernRegCoverageCovSumPass
     : public PassWrapper<ModernRegCoverageCovSumPass,
                          OperationPass<firrtl::CircuitOp>> {
@@ -1364,38 +1202,18 @@ public:
       : statePlan(*this, "state-plan",
                   llvm::cl::desc(
                       "State packing plan: compressed or legacy-like"),
-                  llvm::cl::init("compressed")),
-        exportState(*this, "export-state",
-                    llvm::cl::desc("Export hierarchical io_state ports for "
-                                   "DiffTest coverage feedback"),
-                    llvm::cl::init(false)),
-        stateMapFile(*this, "state-map-file",
-                     llvm::cl::desc(
-                         "Optional JSON path for io_state slot metadata"),
-                     llvm::cl::init("")) {}
+                  llvm::cl::init("compressed")) {}
 
   ModernRegCoverageCovSumPass(const ModernRegCoverageCovSumPass &other)
       : PassWrapper(other),
         statePlan(*this, "state-plan",
                   llvm::cl::desc(
                       "State packing plan: compressed or legacy-like"),
-                  llvm::cl::init("compressed")),
-        exportState(*this, "export-state",
-                    llvm::cl::desc("Export hierarchical io_state ports for "
-                                   "DiffTest coverage feedback"),
-                    llvm::cl::init(false)),
-        stateMapFile(*this, "state-map-file",
-                     llvm::cl::desc(
-                         "Optional JSON path for io_state slot metadata"),
-                     llvm::cl::init("")) {
+                  llvm::cl::init("compressed")) {
     statePlan = other.statePlan.getValue();
-    exportState = other.exportState.getValue();
-    stateMapFile = other.stateMapFile.getValue();
   }
 
   Option<std::string> statePlan;
-  Option<bool> exportState;
-  Option<std::string> stateMapFile;
 
   StringRef getArgument() const final {
     return "difuzzrtl-modern-regcoverage-covsum";
@@ -1415,7 +1233,6 @@ public:
       signalPassFailure();
       return;
     }
-    const bool emitStatePorts = exportState || !stateMapFile.empty();
     MLIRContext *ctx = circuit.getContext();
     OpBuilder builder(ctx);
     auto covSumType = getUInt(ctx, 30);
@@ -1452,8 +1269,7 @@ public:
     infos.reserve(modules.size());
     for (auto module : modules) {
       for (auto port : module.getPorts()) {
-        if (port.getName() == "io_covSum" ||
-            (emitStatePorts && port.getName() == "io_state")) {
+        if (port.getName() == "io_covSum") {
           module.emitError()
               << "DifuzzRTL regCoverage coverage port already exists";
           signalPassFailure();
@@ -1497,25 +1313,6 @@ public:
     }
 
     for (auto &info : infos) {
-      info.module.walk([&](firrtl::InstanceOp inst) {
-        if (auto childIt = moduleIndex.find(inst.getModuleName());
-            childIt != moduleIndex.end())
-          info.childInstances.push_back(
-              ChildInstanceInfo{inst.getName().str(), childIt->second});
-      });
-    }
-
-    if (emitStatePorts) {
-      for (unsigned i = 0, e = infos.size(); i < e; ++i) {
-        llvm::DenseSet<unsigned> active;
-        if (failed(computeStateSlots(i, infos, active))) {
-          signalPassFailure();
-          return;
-        }
-      }
-    }
-
-    for (auto &info : infos) {
       SmallVector<std::pair<unsigned, firrtl::PortInfo>> inserts;
       unsigned nextPort = info.oldPortCount;
       auto addPort = [&](firrtl::PortInfo port) {
@@ -1525,13 +1322,6 @@ public:
       };
       info.covSumPortIndex = addPort(
           firrtl::PortInfo(covSumName, covSumType, firrtl::Direction::Out));
-      if (emitStatePorts && info.stateSlots) {
-        auto stateType =
-            getUInt(ctx, info.stateSlots * kRegCoverageStateSlotBits);
-        info.statePortIndex =
-            addPort(firrtl::PortInfo(builder.getStringAttr("io_state"),
-                                     stateType, firrtl::Direction::Out));
-      }
       info.metaAssertPortIndex = addPort(firrtl::PortInfo(
           metaAssertName, oneBitType, firrtl::Direction::Out));
       info.metaResetPortIndex = addPort(firrtl::PortInfo(
@@ -1571,9 +1361,6 @@ public:
           inst->getResult(i).replaceAllUsesWith(newInst->getResult(i));
         info.childCovSums.push_back(
             newInst->getResult(childInfo.covSumPortIndex));
-        if (emitStatePorts && childInfo.stateSlots)
-          info.childStates.push_back(
-              newInst->getResult(childInfo.statePortIndex));
         info.childMetaAsserts.push_back(
             newInst->getResult(childInfo.metaAssertPortIndex));
         info.childMetaResets.push_back(
@@ -1591,9 +1378,7 @@ public:
       auto loc = info.module.getLoc();
       SmallVector<Value> resettableRegs(info.originalRegs.begin(),
                                         info.originalRegs.end());
-      auto local = insertLocalCoverage(info.module, info.plan);
-      info.localCovSum = local.covSum;
-      info.localState = local.state;
+      info.localCovSum = insertLocalCoverage(info.module, info.plan);
       info.localMetaAssert =
           insertMetaAssert(info.module, info.childMetaAsserts, resettableRegs);
       auto metaAssertPort = info.module.getArgument(info.metaAssertPortIndex);
@@ -1611,15 +1396,6 @@ public:
 
       auto covSumPort = info.module.getArgument(info.covSumPortIndex);
       bodyBuilder.create<firrtl::StrictConnectOp>(loc, covSumPort, sum);
-      if (emitStatePorts && info.stateSlots) {
-        SmallVector<Value> states;
-        if (info.plan.regStateSize)
-          states.push_back(info.localState);
-        states.append(info.childStates.begin(), info.childStates.end());
-        auto statePort = info.module.getArgument(info.statePortIndex);
-        bodyBuilder.create<firrtl::StrictConnectOp>(
-            loc, statePort, catUInts(bodyBuilder, loc, states));
-      }
       bodyBuilder.create<firrtl::StrictConnectOp>(loc, metaAssertPort,
                                                   info.localMetaAssert);
 
@@ -1649,15 +1425,10 @@ public:
         bodyBuilder.create<firrtl::StrictConnectOp>(loc, childMetaReset,
                                                     childReset.getResult());
       }
-	    }
+    }
 
-	    if (failed(writeStateMap(stateMapFile, infos))) {
-	      signalPassFailure();
-	      return;
-	    }
-
-	    if (failed(verify(circuit)))
-	      signalPassFailure();
+    if (failed(verify(circuit)))
+      signalPassFailure();
   }
 };
 
