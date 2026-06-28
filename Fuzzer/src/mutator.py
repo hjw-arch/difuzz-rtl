@@ -5,8 +5,7 @@ from copy import deepcopy
 from inst_generator import Word, rvInstGenerator, PREFIX, MAIN, SUFFIX
 from fuzzer.scheduler import ScheduledCorpus
 from fuzzer.program_backends import (
-    FUZZER_BACKEND_ISAFUZZ,
-    ISAFuzzDifuzzBackend,
+    make_program_backend,
     normalize_fuzzer_backend,
 )
 
@@ -29,7 +28,7 @@ templates = [ 'p-m', 'p-s', 'p-u',
 
 class simInput():
     def __init__(self, prefix: list, words: list, suffix: list, ints: list,
-                 data_seed: int, template: int, structured_payload=None):
+                 data_seed: int, template: int, program_payload=None):
         self.prefix = prefix
         self.words = words
         self.suffix = suffix
@@ -41,7 +40,7 @@ class simInput():
 
         self.data_seed = data_seed
         self.template = template
-        self.structured_payload = structured_payload
+        self.program_payload = program_payload
 
     def save(self, name, data=[]):
         prefix_insts = self.get_prefix()
@@ -137,13 +136,12 @@ class rvMutator():
 
         self.inst_generator = rvInstGenerator('RV64G')
         self.fuzzer_backend = normalize_fuzzer_backend(fuzzer_backend)
-        self.structured_backend = None
+        self.program_backend = make_program_backend(self.fuzzer_backend, random)
         self.last_parent_seed_id = None
         self.last_parent_main_words = 0
         self.last_parent_static_insts = 0
-        if self.fuzzer_backend == FUZZER_BACKEND_ISAFUZZ:
-            self.structured_backend = ISAFuzzDifuzzBackend(random)
-            self.structured_backend.prepare()
+        if self.program_backend is not None:
+            self.program_backend.prepare()
 
     def target_new_bits(self, target_hit_bits):
         return self.scheduled_corpus.new_targets(target_hit_bits or set())
@@ -351,7 +349,7 @@ class rvMutator():
 
         if part == PREFIX:
             min_input = simInput(new_target, words, suffix, ints, data_seed,
-                                 template, sim_input.structured_payload)
+                                 template, sim_input.program_payload)
         elif part == MAIN:
             new_ints = []
             k = 0
@@ -365,10 +363,10 @@ class rvMutator():
 
             min_input = simInput(prefix, new_target, suffix, new_ints,
                                  data_seed, template,
-                                 sim_input.structured_payload)
+                                 sim_input.program_payload)
         else:
             min_input = simInput(prefix, words, new_target, ints, data_seed,
-                                 template, sim_input.structured_payload)
+                                 template, sim_input.program_payload)
 
         data = self.random_data[data_seed]
         return (min_input, data)
@@ -401,7 +399,7 @@ class rvMutator():
 
         del_input = simInput(words_map[PREFIX], words_map[MAIN],
                              words_map[SUFFIX], new_ints, data_seed, template,
-                             sim_input.structured_payload)
+                             sim_input.program_payload)
         data = self.random_data[data_seed]
 
         return (del_input, data)
@@ -452,40 +450,40 @@ class rvMutator():
 
         return words
 
-    def _make_structured_input(self, result):
+    def _make_program_input(self, result):
         prefix, words, suffix, data, template, payload = result
         data_seed = self.add_data(data)
         i_len = sum(word.len_insts for word in words)
         ints = [0 for _ in range(i_len)]
         return (
             simInput(prefix, words, suffix, ints, data_seed, template,
-                     structured_payload=payload),
+                     program_payload=payload),
             self.random_data[data_seed],
         )
 
-    def _get_structured_generation(self, fixed_template=None):
-        if self.structured_backend is None:
+    def _get_program_generation(self, fixed_template=None):
+        if self.program_backend is None:
             return None
         self.last_parent_seed_id = None
         self.last_parent_main_words = 0
         self.last_parent_static_insts = 0
-        result = self.structured_backend.generate(
+        result = self.program_backend.generate(
             fixed_template=fixed_template, with_payload=True)
-        return self._make_structured_input(result)
+        return self._make_program_input(result)
 
-    def _get_structured_mutation(self):
-        if self.structured_backend is None:
+    def _get_program_mutation(self):
+        if self.program_backend is None:
             return None
         seed_si, parent_seed_id = self.choose_corpus_entry()
         if seed_si is None:
             return None
         self._remember_parent(seed_si, parent_seed_id)
-        payload = getattr(seed_si, 'structured_payload', None)
-        result = self.structured_backend.mutate(
+        payload = getattr(seed_si, 'program_payload', None)
+        result = self.program_backend.mutate(
             payload, parent_key=parent_seed_id)
         if result is None:
             return None
-        return self._make_structured_input(result)
+        return self._make_program_input(result)
 
     def get(self, assert_intr=False):
         i_len = 0
@@ -503,11 +501,11 @@ class rvMutator():
             phase = GENERATION
 
         if phase == GENERATION:
-            if self.fuzzer_backend == FUZZER_BACKEND_ISAFUZZ:
+            if self.program_backend is not None:
                 fixed_template = None if template == -1 else template
-                structured = self._get_structured_generation(fixed_template)
-                if structured is not None:
-                    return structured
+                generated = self._get_program_generation(fixed_template)
+                if generated is not None:
+                    return generated
             for n in range(self.num_prefix):
                 word = self.inst_generator.get_word(PREFIX)
                 prefix.append(word)
@@ -519,10 +517,10 @@ class rvMutator():
                 suffix.append(word)
 
         elif phase in [ MUTATION, MERGE ]:
-            if self.fuzzer_backend == FUZZER_BACKEND_ISAFUZZ:
-                structured = self._get_structured_mutation()
-                if structured is not None:
-                    return structured
+            if self.program_backend is not None:
+                mutated = self._get_program_mutation()
+                if mutated is not None:
+                    return mutated
             if phase == MUTATION:
                 seed_si, _parent_seed_id = self.choose_corpus_entry()
                 self._remember_parent(seed_si, _parent_seed_id)
