@@ -27,7 +27,7 @@ class rvRTLhost():
     def __init__(self, dut, toplevel, rtl_sig_file, debug=False,
                  dt_group_json=None, dt_group_pair_id=None,
                  dt_group_feedback_io="auto", dt_group_feedback_bits=False,
-                 dt_group_internal_weight=1):
+                 dt_group_internal_weight=1, dt_group_object_weights=""):
         source_info = os.getenv(
             "DIFUZZRTL_TILE_INFO",
             'infos/' + toplevel + '_info.txt')
@@ -54,6 +54,7 @@ class rvRTLhost():
             feedback_io=dt_group_feedback_io,
             feedback_bits=bool(dt_group_feedback_bits),
             internal_weight=int(dt_group_internal_weight or 1),
+            object_weights=dt_group_object_weights,
         )
         self.module_cov_names = self.coverage.module_cov_names
         self.last_target_cov_hits = set()

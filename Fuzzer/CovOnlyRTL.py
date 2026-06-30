@@ -152,7 +152,8 @@ def _setup_covonly(dut, toplevel, template, out, proc_num, debug,
                    phase_policy, fuzzer_backend, target_cost_aware,
                    target_high_decay_window, dt_group_json,
                    dt_group_pair_id, dt_group_feedback_io,
-                   dt_group_feedback_bits, dt_group_internal_weight):
+                   dt_group_feedback_bits, dt_group_internal_weight,
+                   dt_group_object_weights):
     mutator = rvMutator(
         no_guide=bool(no_guide),
         target_module=target_module,
@@ -179,6 +180,7 @@ def _setup_covonly(dut, toplevel, template, out, proc_num, debug,
         dt_group_feedback_io=dt_group_feedback_io,
         dt_group_feedback_bits=bool(int(dt_group_feedback_bits or 0)),
         dt_group_internal_weight=int(dt_group_internal_weight or 1),
+        dt_group_object_weights=dt_group_object_weights or "",
     )
     return mutator, preprocessor, rtl_host
 
@@ -195,6 +197,7 @@ def RunCovOnly(dut, toplevel,
                dt_group_json=None, dt_group_pair_id=None,
                dt_group_feedback_io="auto", dt_group_feedback_bits=0,
                dt_group_internal_weight=1,
+               dt_group_object_weights="",
                random_seed=0, cov_log=None, status_log=None,
                start_time=0.0, max_seconds=0):
     assert toplevel in ["RocketTile", "BoomTile"], \
@@ -212,7 +215,8 @@ def RunCovOnly(dut, toplevel,
         phase_policy, fuzzer_backend, bool(int(target_cost_aware or 0)),
         int(target_high_decay_window or 0), dt_group_json,
         dt_group_pair_id, dt_group_feedback_io,
-        int(dt_group_feedback_bits or 0), int(dt_group_internal_weight or 1))
+        int(dt_group_feedback_bits or 0), int(dt_group_internal_weight or 1),
+        dt_group_object_weights or "")
 
     module_cov_names = ensure_target_module(
         getattr(rtl_host, "module_cov_names", []),
@@ -401,6 +405,8 @@ parser.add_option("dt_group_feedback_bits", 0,
                   "Enable per-bit DT Group feedback targets")
 parser.add_option("dt_group_internal_weight", 1,
                   "Integer weight for DT Group internal feedback")
+parser.add_option("dt_group_object_weights", "",
+                  "DT object weights, e.g. control_register=4,mux_condition=2")
 parser.add_option("random_seed", 0, "Random seed, 0 means wall-clock seed")
 parser.add_option("max_seconds", 0.0, "Stop after this many wall-clock seconds")
 
