@@ -66,11 +66,6 @@ struct DeclNode {
   std::optional<unsigned> width;
 };
 
-struct MuxInfo {
-  Value sel;
-  std::vector<std::string> sources;
-};
-
 struct VectorGroup {
   unsigned size = 0;
   std::string prefix;
@@ -311,7 +306,9 @@ private:
   llvm::StringSet<> directInputRegs;
   llvm::StringSet<> excludedDirectInputRegs;
   llvm::StringSet<> eligibleCtrlRegs;
-  std::vector<MuxInfo> muxInfos;
+  llvm::DenseMap<Value, SmallVector<std::string>> valueNamesCache;
+  llvm::StringMap<llvm::StringSet<>> firstSourcesCache;
+  llvm::StringMap<SmallVector<Value>> muxSelsBySource;
   std::vector<VectorGroup> vectorGroups;
   llvm::StringSet<> vectorRegNames;
 
@@ -463,27 +460,32 @@ private:
         });
   }
 
-  void findNames(Value value, llvm::StringSet<> &names) const {
+  const SmallVector<std::string> &findNames(Value value) {
+    auto cached = valueNamesCache.find(value);
+    if (cached != valueNamesCache.end())
+      return cached->second;
+
+    SmallVector<std::string> names;
     if (auto name = rootName(value)) {
-      names.insert(*name);
-      return;
+      names.push_back(name->str());
+    } else if (auto *op = value.getDefiningOp()) {
+      auto append = [&](Value source) {
+        for (auto &name : findNames(source))
+          if (std::find(names.begin(), names.end(), name) == names.end())
+            names.push_back(name);
+      };
+      if (auto mux = dyn_cast<firrtl::MuxPrimOp>(op)) {
+        // Legacy graphLedger.Node.findNames intentionally walks only the mux
+        // data arms here. Nested mux conditions are handled when that mux
+        // itself is visited as a mux.
+        append(mux.getHigh());
+        append(mux.getLow());
+      } else {
+        for (auto operand : op->getOperands())
+          append(operand);
+      }
     }
-
-    auto *op = value.getDefiningOp();
-    if (!op)
-      return;
-
-    if (auto mux = dyn_cast<firrtl::MuxPrimOp>(op)) {
-      // Legacy graphLedger.Node.findNames intentionally walks only the mux
-      // data arms here. Nested mux conditions are handled when that mux itself
-      // is visited as a mux.
-      findNames(mux.getHigh(), names);
-      findNames(mux.getLow(), names);
-      return;
-    }
-
-    for (auto operand : op->getOperands())
-      findNames(operand, names);
+    return valueNamesCache.try_emplace(value, std::move(names)).first->second;
   }
 
   void addEdge(StringRef source, StringRef sink) {
@@ -495,10 +497,8 @@ private:
   }
 
   void addSourceEdges(Value src, StringRef sink) {
-    llvm::StringSet<> sources;
-    findNames(src, sources);
-    for (auto &source : sources)
-      addEdge(source.getKey(), sink);
+    for (auto &source : findNames(src))
+      addEdge(source, sink);
   }
 
   void collectEdges() {
@@ -549,37 +549,42 @@ private:
       findSrcs(source.getKey(), visited, sources);
   }
 
-  llvm::StringSet<> firstSources(StringRef sink) const {
-    llvm::StringSet<> visited;
-    llvm::StringSet<> sources;
-    findSrcs(sink, visited, sources);
-    return sources;
+  void appendFirstSources(StringRef sink, llvm::StringSet<> &sources) {
+    auto node = nodes.find(sink);
+    if (node == nodes.end())
+      return;
+    if (isSourceBoundary(node->second.kind)) {
+      sources.insert(sink);
+      return;
+    }
+
+    auto cached = firstSourcesCache.find(sink);
+    if (cached == firstSourcesCache.end()) {
+      llvm::StringSet<> visited;
+      llvm::StringSet<> resolved;
+      findSrcs(sink, visited, resolved);
+      cached = firstSourcesCache.try_emplace(sink, std::move(resolved)).first;
+    }
+    for (auto &source : cached->second)
+      sources.insert(source.getKey());
   }
 
   void collectMuxSources(ModuleAudit &audit) {
     module.walk([&](firrtl::MuxPrimOp mux) {
       llvm::StringSet<> condNames;
-      findNames(mux.getSel(), condNames);
+      for (auto &name : findNames(mux.getSel()))
+        condNames.insert(name);
 
       llvm::StringSet<> muxSources;
-      for (auto &name : condNames) {
-        auto first = firstSources(name.getKey());
-        for (auto &source : first)
-          muxSources.insert(source.getKey());
-      }
+      for (auto &name : condNames)
+        appendFirstSources(name.getKey(), muxSources);
 
       for (auto &source : muxSources) {
         auto it = nodes.find(source.getKey());
         if (it != nodes.end() && isRegisterKind(it->second.kind))
           controlRegs.insert(source.getKey());
+        muxSelsBySource[source.getKey()].push_back(mux.getSel());
       }
-
-      MuxInfo info;
-      info.sel = mux.getSel();
-      for (auto &source : muxSources)
-        info.sources.push_back(source.getKey().str());
-      std::sort(info.sources.begin(), info.sources.end());
-      muxInfos.push_back(std::move(info));
     });
 
     audit.ctrlRegs = controlRegs.size();
@@ -595,12 +600,9 @@ private:
         continue;
 
       llvm::StringSet<> srcs;
-      for (auto &source : rev->second) {
-        auto first = firstSources(source.getKey());
-        for (auto &name : first)
-          if (name.getKey() != reg.getKey())
-            srcs.insert(name.getKey());
-      }
+      for (auto &source : rev->second)
+        appendFirstSources(source.getKey(), srcs);
+      srcs.erase(reg.getKey());
       regSources[reg.getKey()] = std::move(srcs);
     }
 
@@ -736,11 +738,9 @@ private:
 
   llvm::DenseSet<Value> muxSelsForReg(StringRef reg) const {
     llvm::DenseSet<Value> sels;
-    for (auto &mux : muxInfos) {
-      if (std::find(mux.sources.begin(), mux.sources.end(), reg.str()) !=
-          mux.sources.end())
-        sels.insert(mux.sel);
-    }
+    auto found = muxSelsBySource.find(reg);
+    if (found != muxSelsBySource.end())
+      sels.insert(found->second.begin(), found->second.end());
     return sels;
   }
 
@@ -907,11 +907,11 @@ private:
       firstVecNames.push_back(reg.getKey().str());
     std::sort(firstVecNames.begin(), firstVecNames.end());
 
-    std::vector<Value> uncoveredSels;
+    std::vector<std::pair<std::string, Value>> uncoveredSels;
     for (auto sel : uncoveredCtrlSigs)
-      uncoveredSels.push_back(sel);
+      uncoveredSels.emplace_back(valueKey(sel), sel);
     std::sort(uncoveredSels.begin(), uncoveredSels.end(),
-              [](Value lhs, Value rhs) { return valueKey(lhs) < valueKey(rhs); });
+              [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
 
     for (auto &name : optRegNames) {
       const auto &node = nodes.find(name)->second;
@@ -923,9 +923,9 @@ private:
       seedItems.push_back(
           CoverageItem{node.value, node.width.value(), 0, name, false});
     }
-    for (auto sel : uncoveredSels) {
+    for (auto &[name, sel] : uncoveredSels) {
       seedItems.push_back(
-          CoverageItem{sel, 1, 0, valueKey(sel), true});
+          CoverageItem{sel, 1, 0, std::move(name), true});
     }
 
     assignOffsets(seedItems, audit.totalStateBits, audit.regStateSize);

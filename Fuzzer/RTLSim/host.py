@@ -46,7 +46,7 @@ class rvRTLhost():
         self.dut = dut
         self.adapter = tileAdapter(dut, port_names, monitor, self.debug)
         self.toplevel = toplevel
-        self.coverage = DutCoverageObserver(dut, toplevel)
+        self.coverage = DutCoverageObserver(getattr(dut, toplevel, dut), toplevel)
         self.dt_group = DutDtGroupObserver(
             self.coverage,
             dt_group_json,

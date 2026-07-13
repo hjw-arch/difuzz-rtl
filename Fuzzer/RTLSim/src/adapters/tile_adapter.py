@@ -213,7 +213,7 @@ class tileAdapter():
 
     def start(self, memory, ints):
         if memory.__class__.__name__ != 'dict':
-            raise Exception('RocketTile Adapter must receive address map to drive DUT')
+            raise Exception('Tile adapter must receive address map to drive DUT')
 
         self.drive = True
         self.stop_forced = False

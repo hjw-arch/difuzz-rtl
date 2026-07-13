@@ -282,7 +282,7 @@ class tlAdapter():
 
         d_sink_list = [i for i in range(0, 4)]
         d_sinks = FreeList('d_sinks', d_sink_list)
-        b_src_list = [i for i in range(0, 1)] # TODO, BoomTile has 3 b_src
+        b_src_list = [0]
         b_srcs = FreeList('b_srcs', b_src_list)
 
         b_callback = srcToCallback('b_callback', b_src_list)

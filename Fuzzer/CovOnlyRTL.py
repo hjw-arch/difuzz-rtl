@@ -48,7 +48,7 @@ def _status_name(ret) -> str:
     if ret == ILL_MEM:
         return "illegal_mem"
     if ret == TIME_OUT:
-        return "timeout"
+        return "rtl_limit"
     if ret == ASSERTION_FAIL:
         return "assertion_fail"
     if ret == "compile_fail":
@@ -412,6 +412,12 @@ parser.add_option("max_seconds", 0.0, "Stop after this many wall-clock seconds")
 
 parser.print_help()
 parser.parse_option()
+
+# Cocotb may need a physical wrapper to own writable top-level registers.
+# Keep all DifuzzRTL semantics tied to the logical processor top.
+if logical_toplevel := os.getenv("DIFUZZRTL_TOPLEVEL"):
+    _value, _env, _info = parser.arg_map["toplevel"]
+    parser.arg_map["toplevel"] = (logical_toplevel, _env, _info)
 
 out = parser.arg_map["out"][0]
 toplevel = parser.arg_map["toplevel"][0]
