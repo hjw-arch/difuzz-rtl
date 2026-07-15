@@ -197,7 +197,8 @@ def _setup_covonly(dut, toplevel, template, out, proc_num, debug,
 @coroutine
 def RunCovOnly(dut, toplevel,
                num_iter=1, template="Template", out="output", record=0,
-               proc_num=0, debug=0, no_guide=0, target_module=None,
+               proc_num=0, debug=0, in_file=None, no_guide=0,
+               target_module=None,
                seed_scheduler="sgmu", target_bitmap_sample_period=1,
                target_rare_horizon=8, target_max_energy=8,
                phase_policy="default", fuzzer_backend="difuzzrtl",
@@ -226,6 +227,8 @@ def RunCovOnly(dut, toplevel,
         dt_group_pair_id, dt_group_feedback_io,
         int(dt_group_feedback_bits or 0), int(dt_group_internal_weight or 1),
         dt_group_object_weights or "")
+    if in_file:
+        num_iter = 1
 
     module_cov_names = ensure_target_module(
         getattr(rtl_host, "module_cov_names", []),
@@ -261,7 +264,11 @@ def RunCovOnly(dut, toplevel,
         get_s = preprocess_s = rtl_s = post_s = 0.0
 
         t0 = time.perf_counter()
-        sim_input, data = mutator.get(False)
+        assert_intr = False
+        if in_file:
+            sim_input, data, assert_intr = mutator.read_siminput(in_file)
+        else:
+            sim_input, data = mutator.get(False)
         get_s = time.perf_counter() - t0
         total_static = _total_static_insts(sim_input)
         _progress("iter {} generated words={} static_insts={} get_s={:.3f}".format(
@@ -269,7 +276,7 @@ def RunCovOnly(dut, toplevel,
 
         t0 = time.perf_counter()
         isa_input, rtl_input, _symbols = preprocessor.process(
-            sim_input, data, False, write_sim_input=bool(record))
+            sim_input, data, assert_intr, write_sim_input=bool(record))
         preprocess_s = time.perf_counter() - t0
         _progress("iter {} preprocessed ok={} preprocess_s={:.3f}".format(
             it, bool(isa_input and rtl_input), preprocess_s))
@@ -305,7 +312,7 @@ def RunCovOnly(dut, toplevel,
             it, getattr(rtl_input, "max_cycles", "?")))
         result = yield rtl_host.run_test(
             rtl_input,
-            False,
+            assert_intr,
             target_bitmap_module=target_module if target_bits_enabled else None,
             target_bitmap_sample_period=target_bitmap_sample_period,
         )
@@ -438,6 +445,7 @@ parser.add_option("template", "Template", "Template test file location")
 parser.add_option("out", "output", "Directory to save the result")
 parser.add_option("record", 0, "Record corpus and coverage log")
 parser.add_option("debug", 0, "Debugging")
+parser.add_option("in_file", None, "SimInput to replay")
 parser.add_option("no_guide", 0, "Pure random generation")
 parser.add_option("target_module", None, "Target module instance")
 parser.add_option("seed_scheduler", "sgmu",
