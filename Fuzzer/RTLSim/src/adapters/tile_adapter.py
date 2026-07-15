@@ -95,8 +95,10 @@ class intPorts():
             setattr(self, attr, None)
 
 class tileAdapter():
-    def __init__(self, dut, port_names, monitor, debug=False):
+    def __init__(self, dut, port_names, monitor, debug=False,
+                 monitor_dut=None):
         self.dut = dut
+        monitor_dut = dut if monitor_dut is None else monitor_dut
         self.debug = debug
         self.drive = False
 
@@ -151,8 +153,8 @@ class tileAdapter():
         self.reset_vector_port <= self.reset_vector
         self.clear_interrupts()
 
-        self.monitor_pc = resolve_dut_handle(self.dut, pc_name)
-        self.monitor_valid = resolve_dut_handle(self.dut, valid_name)
+        self.monitor_pc = resolve_dut_handle(monitor_dut, pc_name)
+        self.monitor_valid = resolve_dut_handle(monitor_dut, valid_name)
 
         self.intr = 0
         self.stop_forced = False

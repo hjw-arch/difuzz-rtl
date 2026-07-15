@@ -63,6 +63,9 @@ CUSTOM_COMPILE_DEPS += $(VERILATOR_VLT_CONFIG)
 endif
 
 include $(shell cocotb-config --makefiles)/Makefile.inc
+ifneq ($(strip $(DELTARTL_COCOTB_SHARE_DIR)),)
+COCOTB_SHARE_DIR := $(DELTARTL_COCOTB_SHARE_DIR)
+endif
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
 ifneq ($(strip $(VERILATOR_VLT_CONFIG)),)
