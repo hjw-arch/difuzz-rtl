@@ -140,21 +140,72 @@ struct CircuitAudit {
 
 struct ModuleCovSumInfo {
   firrtl::FModuleOp module;
+  bool selected = true;
   unsigned oldPortCount = 0;
   unsigned covSumPortIndex = 0;
   unsigned metaAssertPortIndex = 0;
   unsigned metaResetPortIndex = 0;
-  ModuleAudit audit;
   CoveragePlan plan;
-  SmallVector<Value> originalRegs;
   SmallVector<Value> childCovSums;
-  SmallVector<std::pair<std::string, Value>> childMetaResets;
+  SmallVector<Value> childMetaResets;
   SmallVector<Value> childMetaAsserts;
-  SmallVector<Value> childInternalHalts;
   SmallVector<std::pair<unsigned, firrtl::PortInfo>> insertedPorts;
   Value localCovSum;
   Value localMetaAssert;
 };
+
+static LogicalResult selectTargetModules(firrtl::CircuitOp circuit,
+                                         StringRef targetModule,
+                                         llvm::StringSet<> &selected) {
+  llvm::StringMap<firrtl::FModuleOp> modules;
+  circuit.walk([&](firrtl::FModuleOp module) {
+    modules.try_emplace(module.getName(), module);
+  });
+
+  if (targetModule.empty()) {
+    for (auto &entry : modules)
+      selected.insert(entry.getKey());
+    return success();
+  }
+
+  auto root = modules.find(targetModule);
+  if (root == modules.end())
+    return circuit.emitError() << "DifuzzRTL regCoverage target module `"
+                               << targetModule << "` does not exist";
+
+  SmallVector<firrtl::FModuleOp> worklist{root->second};
+  while (!worklist.empty()) {
+    auto module = worklist.pop_back_val();
+    if (!selected.insert(module.getName()).second)
+      continue;
+    module.walk([&](firrtl::InstanceOp inst) {
+      auto child = modules.find(inst.getModuleName());
+      if (child != modules.end())
+        worklist.push_back(child->second);
+    });
+  }
+
+  for (auto &entry : modules) {
+    if (selected.contains(entry.getKey()))
+      continue;
+    auto parent = entry.second;
+    WalkResult result = parent.walk([&](firrtl::InstanceOp inst) {
+      auto child = inst.getModuleName();
+      if (!selected.contains(child) || child == targetModule)
+        return WalkResult::advance();
+      inst.emitError() << "DifuzzRTL regCoverage target module `"
+                       << targetModule
+                       << "` is not instance-exact: selected descendant `"
+                       << child
+                       << "` is also instantiated by unselected module `"
+                       << parent.getName() << "`";
+      return WalkResult::interrupt();
+    });
+    if (result.wasInterrupted())
+      return failure();
+  }
+  return success();
+}
 
 static firrtl::UIntType getUInt(MLIRContext *ctx, unsigned width) {
   return firrtl::UIntType::get(ctx, width);
@@ -177,21 +228,6 @@ static firrtl::FIRRTLBaseType anonymousBaseType(Type type) {
   if (!base)
     return {};
   return base.getAllConstDroppedType().getAnonymousType();
-}
-
-static Value constantZeroLike(OpBuilder &builder, Location loc, Type type) {
-  auto base = dyn_cast<firrtl::IntType>(anonymousBaseType(type));
-  if (!base)
-    return {};
-
-  auto width = base.getWidth();
-  if (!width || *width < 0)
-    return {};
-
-  return builder
-      .create<firrtl::ConstantOp>(
-          loc, base, llvm::APInt(static_cast<unsigned>(*width), 0))
-      .getResult();
 }
 
 static bool isClockType(Type type) {
@@ -1119,7 +1155,7 @@ static Value orReduce(OpBuilder &builder, Location loc, ArrayRef<Value> values) 
 
 static Value insertMetaAssert(firrtl::FModuleOp module,
                               ArrayRef<Value> childMetaAsserts,
-                              SmallVectorImpl<Value> &resettableRegs) {
+                              Value metaReset, bool includeLocal) {
   OpBuilder builder = module.getBodyBuilder();
   auto loc = module.getLoc();
   auto *ctx = module.getContext();
@@ -1135,7 +1171,8 @@ static Value insertMetaAssert(firrtl::FModuleOp module,
   }
 
   SmallVector<Value> terms;
-  module.walk([&](firrtl::StopOp stop) { terms.push_back(stop.getCond()); });
+  if (includeLocal)
+    module.walk([&](firrtl::StopOp stop) { terms.push_back(stop.getCond()); });
   terms.append(childMetaAsserts.begin(), childMetaAsserts.end());
   if (terms.empty())
     return constantUInt(builder, loc, 1, 0);
@@ -1147,49 +1184,17 @@ static Value insertMetaAssert(firrtl::FModuleOp module,
         loc, oneBit, clock, (module.getName() + "_metaAssert").str(),
         firrtl::NameKindEnum::InterestingName, ArrayRef<Attribute>{},
         StringAttr(), false);
-    resettableRegs.push_back(assertReg.getResult());
     auto next = builder.create<firrtl::OrPrimOp>(loc, oneBit,
                                                 assertReg.getResult(), topOr);
+    auto resetNext = builder.create<firrtl::MuxPrimOp>(
+        loc, oneBit, metaReset, constantUInt(builder, loc, 1, 0),
+        next.getResult());
     builder.create<firrtl::StrictConnectOp>(loc, assertReg.getResult(),
-                                            next.getResult());
+                                            resetNext.getResult());
     return assertReg.getResult();
   }
 
   return topOr;
-}
-
-static void applyMetaResetToRegs(firrtl::FModuleOp module, Value metaReset,
-                                 ArrayRef<Value> resettableRegs) {
-  if (!metaReset)
-    return;
-  llvm::DenseSet<Value> regs(resettableRegs.begin(), resettableRegs.end());
-  SmallVector<Operation *> connects;
-  module.walk([&](firrtl::ConnectOp connect) {
-    if (regs.contains(connect.getDest()))
-      connects.push_back(connect.getOperation());
-  });
-  module.walk([&](firrtl::StrictConnectOp connect) {
-    if (regs.contains(connect.getDest()))
-      connects.push_back(connect.getOperation());
-  });
-
-  auto rewrite = [&](auto connect) {
-    auto dest = connect.getDest();
-    auto src = connect.getSrc();
-    OpBuilder builder(connect);
-    auto zero = constantZeroLike(builder, connect.getLoc(), dest.getType());
-    if (!zero)
-      return;
-    auto mux = builder.create<firrtl::MuxPrimOp>(
-        connect.getLoc(), dest.getType(), metaReset, zero, src);
-    connect.getSrcMutable().assign(mux.getResult());
-  };
-
-  for (auto *op : connects) {
-    TypeSwitch<Operation *>(op)
-        .Case<firrtl::ConnectOp>(rewrite)
-        .Case<firrtl::StrictConnectOp>(rewrite);
-  }
 }
 
 class ModernRegCoverageCovSumPass
@@ -1202,18 +1207,28 @@ public:
       : statePlan(*this, "state-plan",
                   llvm::cl::desc(
                       "State packing plan: compressed or legacy-like"),
-                  llvm::cl::init("compressed")) {}
+                  llvm::cl::init("compressed")),
+        targetModule(*this, "target-module",
+                     llvm::cl::desc(
+                         "Exact module whose definition subtree is covered"),
+                     llvm::cl::init("")) {}
 
   ModernRegCoverageCovSumPass(const ModernRegCoverageCovSumPass &other)
       : PassWrapper(other),
         statePlan(*this, "state-plan",
                   llvm::cl::desc(
                       "State packing plan: compressed or legacy-like"),
-                  llvm::cl::init("compressed")) {
+                  llvm::cl::init("compressed")),
+        targetModule(*this, "target-module",
+                     llvm::cl::desc(
+                         "Exact module whose definition subtree is covered"),
+                     llvm::cl::init("")) {
     statePlan = other.statePlan.getValue();
+    targetModule = other.targetModule.getValue();
   }
 
   Option<std::string> statePlan;
+  Option<std::string> targetModule;
 
   StringRef getArgument() const final {
     return "difuzzrtl-modern-regcoverage-covsum";
@@ -1258,6 +1273,12 @@ public:
       return;
     }
 
+    llvm::StringSet<> selectedModules;
+    if (failed(selectTargetModules(circuit, targetModule, selectedModules))) {
+      signalPassFailure();
+      return;
+    }
+
     SmallVector<firrtl::FModuleOp> modules;
     llvm::StringMap<unsigned> moduleIndex;
     circuit.walk([&](firrtl::FModuleOp module) {
@@ -1285,30 +1306,21 @@ public:
 
       ModuleAudit audit;
       CoveragePlan plan;
-      if (failed(ModuleGraph(module, *statePlanMode).run(audit, &plan))) {
+      bool selected = selectedModules.contains(module.getName());
+      if (selected &&
+          failed(ModuleGraph(module, *statePlanMode).run(audit, &plan))) {
         signalPassFailure();
         return;
       }
 
       ModuleCovSumInfo info;
       info.module = module;
+      info.selected = selected;
       info.oldPortCount = module.getNumPorts();
       info.covSumPortIndex = info.oldPortCount;
       info.metaAssertPortIndex = info.oldPortCount + 1;
       info.metaResetPortIndex = info.oldPortCount + 2;
-      info.audit = audit;
       info.plan = std::move(plan);
-      module.walk([&](Operation *op) {
-        TypeSwitch<Operation *>(op)
-            .Case<firrtl::RegOp>([&](auto reg) {
-              if (bitWidth(reg.getResult().getType()))
-                info.originalRegs.push_back(reg.getResult());
-            })
-            .Case<firrtl::RegResetOp>([&](auto reg) {
-              if (bitWidth(reg.getResult().getType()))
-                info.originalRegs.push_back(reg.getResult());
-            });
-      });
       infos.push_back(info);
     }
 
@@ -1326,17 +1338,6 @@ public:
           metaAssertName, oneBitType, firrtl::Direction::Out));
       info.metaResetPortIndex = addPort(firrtl::PortInfo(
           metaResetName, oneBitType, firrtl::Direction::In));
-
-      SmallVector<firrtl::InstanceOp> directInstances;
-      info.module.walk([&](firrtl::InstanceOp inst) {
-        if (moduleIndex.contains(inst.getModuleName()))
-          directInstances.push_back(inst);
-      });
-      for (auto inst : directInstances) {
-        auto haltName = (inst.getName() + "_halt").str();
-        addPort(firrtl::PortInfo(builder.getStringAttr(haltName), oneBitType,
-                                 firrtl::Direction::In));
-      }
 
       inserts.append(info.insertedPorts.begin(), info.insertedPorts.end());
       info.module.insertPorts(inserts);
@@ -1364,11 +1365,7 @@ public:
         info.childMetaAsserts.push_back(
             newInst->getResult(childInfo.metaAssertPortIndex));
         info.childMetaResets.push_back(
-            {inst.getName().str(),
-             newInst->getResult(childInfo.metaResetPortIndex)});
-        for (unsigned i = childInfo.metaResetPortIndex + 1;
-             i < newInst->getNumResults(); ++i)
-          info.childInternalHalts.push_back(newInst->getResult(i));
+            newInst->getResult(childInfo.metaResetPortIndex));
         inst.erase();
       }
     }
@@ -1376,14 +1373,13 @@ public:
     for (auto &info : infos) {
       OpBuilder bodyBuilder = info.module.getBodyBuilder();
       auto loc = info.module.getLoc();
-      SmallVector<Value> resettableRegs(info.originalRegs.begin(),
-                                        info.originalRegs.end());
       info.localCovSum = insertLocalCoverage(info.module, info.plan);
-      info.localMetaAssert =
-          insertMetaAssert(info.module, info.childMetaAsserts, resettableRegs);
       auto metaAssertPort = info.module.getArgument(info.metaAssertPortIndex);
       auto metaResetPort = info.module.getArgument(info.metaResetPortIndex);
-      applyMetaResetToRegs(info.module, metaResetPort, resettableRegs);
+      // metaReset is instrumentation-only; it must never rewrite DUT state.
+      info.localMetaAssert =
+          insertMetaAssert(info.module, info.childMetaAsserts, metaResetPort,
+                           info.selected);
 
       Value sum = info.localCovSum ? info.localCovSum
                                    : constantUInt(bodyBuilder, loc, 30, 0);
@@ -1399,32 +1395,9 @@ public:
       bodyBuilder.create<firrtl::StrictConnectOp>(loc, metaAssertPort,
                                                   info.localMetaAssert);
 
-      auto zeroOne = constantUInt(bodyBuilder, loc, 1, 0);
-      for (auto halt : info.childInternalHalts)
-        bodyBuilder.create<firrtl::StrictConnectOp>(loc, halt, zeroOne);
-
-      for (auto &entry : info.childMetaResets) {
-        const auto &instName = entry.first;
-        Value childMetaReset = entry.second;
-        auto haltPortName = instName + "_halt";
-        Value haltPort;
-        for (auto [index, port] : llvm::enumerate(info.module.getPorts())) {
-          if (port.getName() == haltPortName) {
-            haltPort = info.module.getArgument(index);
-            break;
-          }
-        }
-        if (!haltPort) {
-          info.module.emitError() << "missing generated halt port `"
-                                  << haltPortName << "`";
-          signalPassFailure();
-          return;
-        }
-        auto childReset = bodyBuilder.create<firrtl::OrPrimOp>(
-            loc, oneBitType, metaResetPort, haltPort);
+      for (auto childMetaReset : info.childMetaResets)
         bodyBuilder.create<firrtl::StrictConnectOp>(loc, childMetaReset,
-                                                    childReset.getResult());
-      }
+                                                    metaResetPort);
     }
 
     if (failed(verify(circuit)))
@@ -1442,18 +1415,28 @@ public:
       : statePlan(*this, "state-plan",
                   llvm::cl::desc(
                       "State packing plan: compressed or legacy-like"),
-                  llvm::cl::init("compressed")) {}
+                  llvm::cl::init("compressed")),
+        targetModule(*this, "target-module",
+                     llvm::cl::desc(
+                         "Exact module whose definition subtree is audited"),
+                     llvm::cl::init("")) {}
 
   ModernRegCoverageAuditPass(const ModernRegCoverageAuditPass &other)
       : PassWrapper(other),
         statePlan(*this, "state-plan",
                   llvm::cl::desc(
                       "State packing plan: compressed or legacy-like"),
-                  llvm::cl::init("compressed")) {
+                  llvm::cl::init("compressed")),
+        targetModule(*this, "target-module",
+                     llvm::cl::desc(
+                         "Exact module whose definition subtree is audited"),
+                     llvm::cl::init("")) {
     statePlan = other.statePlan.getValue();
+    targetModule = other.targetModule.getValue();
   }
 
   Option<std::string> statePlan;
+  Option<std::string> targetModule;
 
   StringRef getArgument() const final {
     return "difuzzrtl-modern-regcoverage-audit";
@@ -1475,8 +1458,15 @@ public:
     }
     CircuitAudit circuitAudit;
     bool hadFailure = false;
+    llvm::StringSet<> selectedModules;
+    if (failed(selectTargetModules(circuit, targetModule, selectedModules))) {
+      signalPassFailure();
+      return;
+    }
 
     circuit.walk([&](firrtl::FModuleOp module) {
+      if (!selectedModules.contains(module.getName()))
+        return;
       ModuleAudit audit;
       if (failed(ModuleGraph(module, *statePlanMode).run(audit))) {
         hadFailure = true;
@@ -1516,7 +1506,10 @@ public:
 
     circuit.emitRemark()
         << "difuzzrtl modern regcoverage circuit audit: state_plan="
-        << statePlanModeName(*statePlanMode) << " modules="
+        << statePlanModeName(*statePlanMode) << " target_module="
+        << (targetModule.empty() ? StringRef("all")
+                                 : StringRef(targetModule.getValue()))
+        << " modules="
         << circuitAudit.modules
         << " modules_with_ctrl=" << circuitAudit.modulesWithCtrl
         << " modules_with_state=" << circuitAudit.modulesWithState
