@@ -57,6 +57,8 @@ class rvRTLhost():
             object_weights=dt_group_object_weights,
         )
         self.module_cov_names = self.coverage.module_cov_names
+        self.last_bitmap_target_hits = set()
+        self.last_dt_group_feedback_hits = set()
         self.last_target_cov_hits = set()
         self.last_target_cov_module = None
         self.last_target_handle_count = 0
@@ -139,6 +141,8 @@ class rvRTLhost():
                  target_bitmap_module=None, target_bitmap_sample_period=1):
 
         self.debug_print('[RTLHost] Start RTL simulation')
+        self.last_bitmap_target_hits = set()
+        self.last_dt_group_feedback_hits = set()
         self.last_target_cov_hits = set()
         self.last_target_cov_module = target_bitmap_module
         self.last_target_handle_count = 0
@@ -210,8 +214,7 @@ class rvRTLhost():
             if target_cov_trace_handles and \
                i % target_bitmap_sample_period == 0:
                 self.coverage.sample_tagged_handles(
-                    target_cov_trace_handles,
-                    self.last_target_cov_hits)
+                    target_cov_trace_handles, self.last_bitmap_target_hits)
             if self.dt_group.enabled and i % target_bitmap_sample_period == 0:
                 self.dt_group.sample()
 
@@ -228,8 +231,10 @@ class rvRTLhost():
         clk_driver.kill()
         self.last_dt_group_observation = self.dt_group.observe()
         if self.last_dt_group_observation is not None:
-            self.last_target_cov_hits.update(
+            self.last_dt_group_feedback_hits = set(
                 self.last_dt_group_observation.feedback_targets)
+        self.last_target_cov_hits = (
+            self.last_bitmap_target_hits | self.last_dt_group_feedback_hits)
 
         # Check all the CPU's memory access operations occurs in DRAM
         mem_check = True

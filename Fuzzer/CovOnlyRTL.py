@@ -81,13 +81,17 @@ def _scheduler_needs_target_bits(
         "priority": "target_high",
     }
     mode = aliases.get(mode, mode)
+    if dt_group_json and not target_module:
+        return mode in {"sgmu", "target_new", "target_high"}
     return mode in {"sgmu", "target_new"}
 
 
 def _dt_group_summary(rtl_host) -> dict:
     observation = getattr(rtl_host, "last_dt_group_observation", None)
+    observer = getattr(rtl_host, "dt_group", None)
     if observation is None:
         return {
+            "selected_bits": int(getattr(observer, "selected_bits", 0) or 0),
             "feedback": 0,
             "states": 0,
             "metadata": 0,
@@ -95,6 +99,7 @@ def _dt_group_summary(rtl_host) -> dict:
             "target_score": 0,
         }
     return {
+        "selected_bits": int(getattr(observer, "selected_bits", 0) or 0),
         "feedback": len(getattr(observation, "feedback_targets", ()) or ()),
         "states": len(getattr(observation, "monitor_states", ()) or ()),
         "metadata": len(getattr(observation, "metadata_states", ()) or ()),
@@ -119,7 +124,9 @@ def _status_header() -> str:
         "iter", "phase", "status", "coverage", "target_cov",
         "best_target_cov", "best_total_cov", "target_bits_enabled",
         "target_handles", "rtl_cycles", "target_hits", "target_new",
-        "dtg_handles", "dtg_feedback", "dtg_states", "dtg_metadata",
+        "bitmap_target_hits", "bitmap_target_new",
+        "dtg_handles", "dtg_selected_bits", "dtg_feedback",
+        "dtg_target_hits", "dtg_target_new", "dtg_states", "dtg_metadata",
         "dtg_missing_ports", "dtg_target_score",
         "admitted", "corpus", "main_words", "total_static_insts", "get_s",
         "preprocess_s", "rtl_s", "post_s", "total_s",
@@ -230,6 +237,8 @@ def RunCovOnly(dut, toplevel,
     corpus_count = 0
     target_bits_enabled = _scheduler_needs_target_bits(
         seed_scheduler, target_module, dt_group_json)
+    if str(dt_group_json or "").strip() and rtl_host.dt_group.selected_bits <= 0:
+        raise ValueError("DT Group manifest has no selected feedback bits")
     max_seconds = float(max_seconds or 0)
     wall_start = float(start_time or time.time())
 
@@ -263,8 +272,8 @@ def RunCovOnly(dut, toplevel,
                 _append_status(status_log, [
                     it, phase_at_get, "compile_fail", last_coverage, 0,
                     best_target_cov, best_total_cov,
-                    int(target_bits_enabled), 0, 0, 0, 0,
-                    0, 0, 0, 0, "", 0, 0,
+                    int(target_bits_enabled),
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", 0, 0,
                     len(mutator.corpus), sim_input.num_words, total_static,
                     get_s, preprocess_s, rtl_s, post_s,
                     time.perf_counter() - iter_t0,
@@ -300,9 +309,16 @@ def RunCovOnly(dut, toplevel,
             module_covs = last_module_covs.copy()
 
         t0 = time.perf_counter()
-        target_hit_bits = set(getattr(rtl_host, "last_target_cov_hits", set())) \
+        bitmap_target_hit_bits = set(
+            getattr(rtl_host, "last_bitmap_target_hits", set())) \
             if target_bits_enabled else set()
+        dtg_target_hit_bits = set(
+            getattr(rtl_host, "last_dt_group_feedback_hits", set())) \
+            if target_bits_enabled else set()
+        target_hit_bits = bitmap_target_hit_bits | dtg_target_hit_bits
         target_new_bits = mutator.target_new_bits(target_hit_bits)
+        bitmap_target_new_bits = mutator.target_new_bits(bitmap_target_hit_bits)
+        dtg_target_new_bits = mutator.target_new_bits(dtg_target_hit_bits)
         add_for_target = bool(target_bits_enabled and target_new_bits)
         add_for_warmup = _is_generation_warmup(mutator, phase_at_get, it)
         post_s = time.perf_counter() - t0
@@ -354,8 +370,11 @@ def RunCovOnly(dut, toplevel,
                 int(getattr(rtl_host, "last_target_handle_count", 0) or 0),
                 int(getattr(rtl_host, "last_cycles", 0) or 0),
                 len(target_hit_bits), len(target_new_bits),
+                len(bitmap_target_hit_bits), len(bitmap_target_new_bits),
                 int(getattr(rtl_host, "last_dt_group_handle_count", 0) or 0),
-                dtg["feedback"], dtg["states"], dtg["metadata"],
+                dtg["selected_bits"], dtg["feedback"],
+                len(dtg_target_hit_bits), len(dtg_target_new_bits),
+                dtg["states"], dtg["metadata"],
                 dtg["missing_ports"], dtg["target_score"],
                 int(admitted),
                 len(mutator.corpus), sim_input.num_words, total_static, get_s,
