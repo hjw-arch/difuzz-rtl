@@ -53,6 +53,7 @@ def resolve_dut_handle(dut, name):
         name,
         flat_slash,
         flat_dot,
+        "\\{} ".format(flat_slash),
         name.replace(".", "__DOT__").replace("/", "__DOT__"),
         _verilator_escaped_name(flat_slash),
     ]
