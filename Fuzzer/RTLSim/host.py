@@ -186,6 +186,8 @@ class rvRTLhost():
 
             offset += (data_end - data_start) // 8
 
+        self.debug_print('[RTLHost] Prepared memory image')
+
         ints = {}
         if assert_intr:
             fd = open(rtl_input.intrfile, 'r')
@@ -206,9 +208,12 @@ class rvRTLhost():
         self.dt_group.reset()
         self.last_dt_group_handle_count = self.dt_group.handle_count
 
+        self.debug_print('[RTLHost] Reset begin')
         yield self.reset(clk, self.dut.metaReset, self.dut.reset)
+        self.debug_print('[RTLHost] Reset complete')
 
         self.adapter.start(memory, ints)
+        self.debug_print('[RTLHost] Execution begin')
         for i in range(max_cycles):
             yield clkedge
             if target_cov_trace_handles and \
@@ -225,9 +230,13 @@ class rvRTLhost():
                 else:
                     self.adapter.probe_tohost(tohost_addr)
         self.last_cycles = i + 1
+        self.debug_print('[RTLHost] Execution complete cycles={}'.format(
+            self.last_cycles))
 
         yield self.adapter.stop()
         adapter_stop_forced = bool(getattr(self.adapter, 'stop_forced', False))
+        self.debug_print('[RTLHost] Adapter stopped forced={}'.format(
+            adapter_stop_forced))
         clk_driver.kill()
         self.last_dt_group_observation = self.dt_group.observe()
         if self.last_dt_group_observation is not None:
