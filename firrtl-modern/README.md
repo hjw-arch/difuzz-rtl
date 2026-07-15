@@ -51,6 +51,17 @@ Implemented pass entry points:
   both modes and `covSum` arithmetic is truncated back to 30 bits.
   `target-module` changes only which module definitions contribute local
   coverage; it does not change either mapping algorithm.
+* Inserted state, coverage bitmap, `covSum`, and sticky `metaAssert` storage is
+  implemented as instrumentation-only memories initialized from exact-size
+  zero files.  This prevents Verilator's `randReset(2)` from pre-marking
+  coverage without changing any DUT register or reset behavior.  The pass
+  requires an absolute `coverage-init-dir`; it creates only the exact memory
+  depths selected by the pass.  An existing `zeros-<depth>.hex` must contain
+  exactly `<depth>` zero entries or the transform fails.
+  CIRCT 1.59 emits `$readmemh` before its optional
+  `RANDOMIZE_MEM_INIT` block, so simulator builds must not define that
+  SystemVerilog macro.  Verilator's C++ `randReset(2)` remains supported: the
+  first evaluation reloads only inserted metadata from the zero files.
 * `target-module=<exact-name>` limits local coverage and local stop collection
   to every instance of that module definition and its transitive child
   definitions.  Other modules only aggregate `io_covSum`/`metaAssert` and
@@ -59,9 +70,10 @@ Implemented pass entry points:
   instantiated outside the selected closure; this keeps module selection
   instance-exact instead of silently instrumenting unrelated hierarchy.
 * `metaReset` clears only the inserted sticky module-local `metaAssert`
-  register.  It never rewrites a pre-existing DUT register.  It deliberately
+  storage.  It never rewrites a pre-existing DUT register.  It deliberately
   does not clear inserted coverage state, the coverage bitmap, or `covSum`,
-  because the fuzzer observes cumulative coverage.  `metaAssert` is the OR of
+  because the fuzzer observes cumulative coverage across tests in one
+  simulation process.  `metaAssert` is the OR of
   selected local stop conditions and direct child `metaAssert` outputs.
 
 Version-boundary rule:
@@ -107,7 +119,7 @@ DifuzzRTL-alignment plan:
 ```sh
 firtool input.fir \
   --load-pass-plugin=/tmp/difuzzrtl-modern-regcov-build/libDifuzzRTLModernRegCoverage.so \
-  --low-firrtl-pass-plugin='firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{target-module=RocketTile state-plan=legacy-like})' \
+  --low-firrtl-pass-plugin='firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{target-module=RocketTile state-plan=legacy-like coverage-init-dir=/tmp/regcov-init})' \
   --verilog -o regcov.v
 ```
 

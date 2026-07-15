@@ -14,6 +14,7 @@
 #include "mlir/Tools/Plugins/PassPlugin.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -21,9 +22,12 @@
 #include "llvm/Support/Compiler.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cctype>
+#include <fstream>
 #include <map>
 #include <optional>
 #include <set>
@@ -285,29 +289,152 @@ static Value truncateToUInt30(OpBuilder &builder, Location loc, Value value) {
       .getResult();
 }
 
-static firrtl::BundleType coverageReadPortType(MLIRContext *ctx,
-                                               firrtl::UIntType addrType) {
+static firrtl::BundleType memoryReadPortType(MLIRContext *ctx,
+                                             firrtl::UIntType addrType,
+                                             firrtl::UIntType dataType) {
   auto oneBit = getUInt(ctx, 1);
   SmallVector<firrtl::BundleType::BundleElement> elems;
   elems.emplace_back(StringAttr::get(ctx, "addr"), false, addrType);
   elems.emplace_back(StringAttr::get(ctx, "en"), false, oneBit);
   elems.emplace_back(StringAttr::get(ctx, "clk"), false,
                      firrtl::ClockType::get(ctx));
-  elems.emplace_back(StringAttr::get(ctx, "data"), true, oneBit);
+  elems.emplace_back(StringAttr::get(ctx, "data"), true, dataType);
   return firrtl::BundleType::get(ctx, elems);
 }
 
-static firrtl::BundleType coverageWritePortType(MLIRContext *ctx,
-                                                firrtl::UIntType addrType) {
+static firrtl::BundleType memoryWritePortType(MLIRContext *ctx,
+                                              firrtl::UIntType addrType,
+                                              firrtl::UIntType dataType) {
   auto oneBit = getUInt(ctx, 1);
   SmallVector<firrtl::BundleType::BundleElement> elems;
   elems.emplace_back(StringAttr::get(ctx, "addr"), false, addrType);
   elems.emplace_back(StringAttr::get(ctx, "en"), false, oneBit);
   elems.emplace_back(StringAttr::get(ctx, "clk"), false,
                      firrtl::ClockType::get(ctx));
-  elems.emplace_back(StringAttr::get(ctx, "data"), false, oneBit);
+  elems.emplace_back(StringAttr::get(ctx, "data"), false, dataType);
   elems.emplace_back(StringAttr::get(ctx, "mask"), false, oneBit);
   return firrtl::BundleType::get(ctx, elems);
+}
+
+static std::string zeroInitPath(StringRef directory, uint64_t depth) {
+  llvm::SmallString<256> path(directory);
+  llvm::sys::path::append(path,
+                          ("zeros-" + std::to_string(depth) + ".hex"));
+  return path.str().str();
+}
+
+static LogicalResult validateZeroInitFile(Operation *anchor, StringRef path,
+                                          uint64_t depth) {
+  std::ifstream input(path.str());
+  if (!input)
+    return anchor->emitError()
+           << "missing DifuzzRTL zero-initialization file `" << path << "`";
+
+  uint64_t entries = 0;
+  std::string token;
+  while (input >> token) {
+    if (token != "0")
+      return anchor->emitError()
+             << "DifuzzRTL initialization file `" << path
+             << "` contains a non-zero entry";
+    if (++entries > depth)
+      return anchor->emitError()
+             << "DifuzzRTL initialization file `" << path
+             << "` has more than " << depth << " entries";
+  }
+  if (entries != depth)
+    return anchor->emitError()
+           << "DifuzzRTL initialization file `" << path << "` has "
+           << entries << " entries; expected " << depth;
+  return success();
+}
+
+static LogicalResult ensureZeroInitFile(Operation *anchor, StringRef directory,
+                                        uint64_t depth) {
+  std::error_code error = llvm::sys::fs::create_directories(directory);
+  if (error)
+    return anchor->emitError()
+           << "cannot create DifuzzRTL initialization directory `" << directory
+           << "`: " << error.message();
+
+  auto path = zeroInitPath(directory, depth);
+  if (!llvm::sys::fs::exists(path)) {
+    llvm::raw_fd_ostream output(path, error, llvm::sys::fs::OF_Text);
+    if (error)
+      return anchor->emitError()
+             << "cannot create DifuzzRTL initialization file `" << path
+             << "`: " << error.message();
+    for (uint64_t i = 0; i < depth; ++i)
+      output << "0\n";
+    output.close();
+    if (output.has_error())
+      return anchor->emitError()
+             << "cannot write DifuzzRTL initialization file `" << path << "`";
+  }
+  return validateZeroInitFile(anchor, path, depth);
+}
+
+struct MemoryPorts {
+  Value readAddr;
+  Value readEn;
+  Value readClk;
+  Value readData;
+  Value writeAddr;
+  Value writeEn;
+  Value writeClk;
+  Value writeData;
+  Value writeMask;
+};
+
+static MemoryPorts getMemoryPorts(OpBuilder &builder, Location loc,
+                                  firrtl::MemOp memory) {
+  Value readPort = memory.getResult(0);
+  Value writePort = memory.getResult(1);
+  return {
+      builder.create<firrtl::SubfieldOp>(loc, readPort, "addr").getResult(),
+      builder.create<firrtl::SubfieldOp>(loc, readPort, "en").getResult(),
+      builder.create<firrtl::SubfieldOp>(loc, readPort, "clk").getResult(),
+      builder.create<firrtl::SubfieldOp>(loc, readPort, "data").getResult(),
+      builder.create<firrtl::SubfieldOp>(loc, writePort, "addr").getResult(),
+      builder.create<firrtl::SubfieldOp>(loc, writePort, "en").getResult(),
+      builder.create<firrtl::SubfieldOp>(loc, writePort, "clk").getResult(),
+      builder.create<firrtl::SubfieldOp>(loc, writePort, "data").getResult(),
+      builder.create<firrtl::SubfieldOp>(loc, writePort, "mask").getResult(),
+  };
+}
+
+static firrtl::MemOp createZeroInitializedMemory(
+    OpBuilder &builder, Location loc, firrtl::UIntType addrType,
+    firrtl::UIntType dataType, uint64_t depth, StringRef name,
+    StringRef initDirectory) {
+  SmallVector<Type> portTypes{
+      memoryReadPortType(builder.getContext(), addrType, dataType),
+      memoryWritePortType(builder.getContext(), addrType, dataType)};
+  SmallVector<Attribute> portNames{builder.getStringAttr("read"),
+                                   builder.getStringAttr("write")};
+  auto init = firrtl::MemoryInitAttr::get(
+      builder.getContext(),
+      builder.getStringAttr(zeroInitPath(initDirectory, depth)), false, true);
+  auto empty = builder.getArrayAttr({});
+  auto portAnnotations = builder.getArrayAttr({empty, empty});
+  return builder.create<firrtl::MemOp>(
+      loc, TypeRange(portTypes), 0, 1, depth, firrtl::RUWAttr::Undefined,
+      builder.getArrayAttr(portNames), name,
+      firrtl::NameKindEnum::InterestingName, empty, portAnnotations,
+      circt::hw::InnerSymAttr(), init, StringAttr());
+}
+
+static void connectMemoryControl(OpBuilder &builder, Location loc,
+                                 const MemoryPorts &ports, Value clock,
+                                 Value readAddr, Value writeAddr) {
+  auto one = constantUInt(builder, loc, 1, 1);
+  builder.create<firrtl::StrictConnectOp>(loc, ports.readAddr, readAddr);
+  builder.create<firrtl::StrictConnectOp>(loc, ports.readEn, one);
+  builder.create<firrtl::StrictConnectOp>(loc, ports.readClk, clock);
+  builder.create<firrtl::StrictConnectOp>(loc, ports.writeAddr, writeAddr);
+  builder.create<firrtl::StrictConnectOp>(loc, ports.writeEn, one);
+  builder.create<firrtl::StrictConnectOp>(loc, ports.writeClk, clock);
+  builder.create<firrtl::StrictConnectOp>(loc, ports.writeMask, one);
 }
 
 class ModuleGraph {
@@ -1051,7 +1178,8 @@ static Value buildStateExpression(OpBuilder &builder, Location loc,
 }
 
 static Value insertLocalCoverage(firrtl::FModuleOp module,
-                                 const CoveragePlan &plan) {
+                                 const CoveragePlan &plan,
+                                 StringRef initDirectory) {
   OpBuilder builder = module.getBodyBuilder();
   auto loc = module.getLoc();
   auto *ctx = module.getContext();
@@ -1064,70 +1192,45 @@ static Value insertLocalCoverage(firrtl::FModuleOp module,
     return zeroCovSum;
 
   auto stateType = getUInt(ctx, plan.regStateSize);
-  auto oneBit = getUInt(ctx, 1);
   auto stateName = (moduleName + "_state").str();
   auto covMapName = (moduleName + "_cov").str();
   auto covSumName = (moduleName + "_covSum").str();
+  auto zeroAddr = constantUInt(builder, loc, 1, 0);
+  auto one = constantUInt(builder, loc, 1, 1);
 
-  auto stateReg = builder.create<firrtl::RegOp>(
-      loc, stateType, clock, stateName, firrtl::NameKindEnum::InterestingName,
-      ArrayRef<Attribute>{}, StringAttr(), false);
+  auto stateMemory = createZeroInitializedMemory(
+      builder, loc, getUInt(ctx, 1), stateType, 1, stateName, initDirectory);
+  auto statePorts = getMemoryPorts(builder, loc, stateMemory);
+  connectMemoryControl(builder, loc, statePorts, clock, zeroAddr, zeroAddr);
 
-  SmallVector<Type> portTypes;
-  portTypes.push_back(coverageReadPortType(ctx, stateType));
-  portTypes.push_back(coverageWritePortType(ctx, stateType));
-  SmallVector<Attribute> portNames;
-  portNames.push_back(builder.getStringAttr("read"));
-  portNames.push_back(builder.getStringAttr("write"));
-  auto covMap = builder.create<firrtl::MemOp>(
-      loc, TypeRange(portTypes), 0, 1, static_cast<uint64_t>(plan.covMapSize),
-      firrtl::RUWAttr::Undefined, portNames, covMapName,
-      firrtl::NameKindEnum::InterestingName, ArrayRef<Attribute>{},
-      ArrayRef<Attribute>{}, StringAttr());
+  auto covMap = createZeroInitializedMemory(
+      builder, loc, stateType, getUInt(ctx, 1), plan.covMapSize, covMapName,
+      initDirectory);
+  auto covPorts = getMemoryPorts(builder, loc, covMap);
 
-  auto covSumReg = builder.create<firrtl::RegOp>(
-      loc, covSumType, clock, covSumName, firrtl::NameKindEnum::InterestingName,
-      ArrayRef<Attribute>{}, StringAttr(), false);
+  auto covSumMemory = createZeroInitializedMemory(
+      builder, loc, getUInt(ctx, 1), covSumType, 1, covSumName,
+      initDirectory);
+  auto covSumPorts = getMemoryPorts(builder, loc, covSumMemory);
+  connectMemoryControl(builder, loc, covSumPorts, clock, zeroAddr, zeroAddr);
 
   auto stateExpr = buildStateExpression(builder, loc, plan);
-  builder.create<firrtl::StrictConnectOp>(loc, stateReg.getResult(),
+  builder.create<firrtl::StrictConnectOp>(loc, statePorts.writeData,
                                           stateExpr);
-
-  Value readPort = covMap.getResult(0);
-  Value writePort = covMap.getResult(1);
-  auto readAddr = builder.create<firrtl::SubfieldOp>(loc, readPort, "addr");
-  auto readEn = builder.create<firrtl::SubfieldOp>(loc, readPort, "en");
-  auto readClk = builder.create<firrtl::SubfieldOp>(loc, readPort, "clk");
-  auto readData = builder.create<firrtl::SubfieldOp>(loc, readPort, "data");
-  auto writeAddr = builder.create<firrtl::SubfieldOp>(loc, writePort, "addr");
-  auto writeEn = builder.create<firrtl::SubfieldOp>(loc, writePort, "en");
-  auto writeClk = builder.create<firrtl::SubfieldOp>(loc, writePort, "clk");
-  auto writeData = builder.create<firrtl::SubfieldOp>(loc, writePort, "data");
-  auto writeMask = builder.create<firrtl::SubfieldOp>(loc, writePort, "mask");
-
-  auto one = constantUInt(builder, loc, 1, 1);
-  builder.create<firrtl::StrictConnectOp>(loc, readAddr.getResult(),
-                                          stateReg.getResult());
-  builder.create<firrtl::StrictConnectOp>(loc, readEn.getResult(), one);
-  builder.create<firrtl::StrictConnectOp>(loc, readClk.getResult(), clock);
-  builder.create<firrtl::StrictConnectOp>(loc, writeAddr.getResult(),
-                                          stateReg.getResult());
-  builder.create<firrtl::StrictConnectOp>(loc, writeEn.getResult(), one);
-  builder.create<firrtl::StrictConnectOp>(loc, writeClk.getResult(), clock);
-  builder.create<firrtl::StrictConnectOp>(loc, writeData.getResult(), one);
-  builder.create<firrtl::StrictConnectOp>(loc, writeMask.getResult(), one);
+  connectMemoryControl(builder, loc, covPorts, clock, statePorts.readData,
+                       statePorts.readData);
+  builder.create<firrtl::StrictConnectOp>(loc, covPorts.writeData, one);
 
   auto plusOneWide =
-      builder.create<firrtl::AddPrimOp>(loc, covSumReg.getResult(),
+      builder.create<firrtl::AddPrimOp>(loc, covSumPorts.readData,
                                         constantUInt(builder, loc, 1, 1));
   auto plusOne = truncateToUInt30(builder, loc, plusOneWide.getResult());
   auto nextCovSum = builder.create<firrtl::MuxPrimOp>(
-      loc, covSumType, readData.getResult(), covSumReg.getResult(), plusOne);
-  builder.create<firrtl::StrictConnectOp>(loc, covSumReg.getResult(),
+      loc, covSumType, covPorts.readData, covSumPorts.readData, plusOne);
+  builder.create<firrtl::StrictConnectOp>(loc, covSumPorts.writeData,
                                           nextCovSum.getResult());
 
-  (void)oneBit;
-  return covSumReg.getResult();
+  return covSumPorts.readData;
 }
 
 static Value orReduce(OpBuilder &builder, Location loc, ArrayRef<Value> values) {
@@ -1155,7 +1258,8 @@ static Value orReduce(OpBuilder &builder, Location loc, ArrayRef<Value> values) 
 
 static Value insertMetaAssert(firrtl::FModuleOp module,
                               ArrayRef<Value> childMetaAsserts,
-                              Value metaReset, bool includeLocal) {
+                              Value metaReset, bool includeLocal,
+                              StringRef initDirectory) {
   OpBuilder builder = module.getBodyBuilder();
   auto loc = module.getLoc();
   auto *ctx = module.getContext();
@@ -1180,18 +1284,20 @@ static Value insertMetaAssert(firrtl::FModuleOp module,
   Value topOr = orReduce(builder, loc, terms);
 
   if (clock && reset) {
-    auto assertReg = builder.create<firrtl::RegOp>(
-        loc, oneBit, clock, (module.getName() + "_metaAssert").str(),
-        firrtl::NameKindEnum::InterestingName, ArrayRef<Attribute>{},
-        StringAttr(), false);
+    auto zeroAddr = constantUInt(builder, loc, 1, 0);
+    auto assertMemory = createZeroInitializedMemory(
+        builder, loc, oneBit, oneBit, 1,
+        (module.getName() + "_metaAssert").str(), initDirectory);
+    auto assertPorts = getMemoryPorts(builder, loc, assertMemory);
+    connectMemoryControl(builder, loc, assertPorts, clock, zeroAddr, zeroAddr);
     auto next = builder.create<firrtl::OrPrimOp>(loc, oneBit,
-                                                assertReg.getResult(), topOr);
+                                                assertPorts.readData, topOr);
     auto resetNext = builder.create<firrtl::MuxPrimOp>(
         loc, oneBit, metaReset, constantUInt(builder, loc, 1, 0),
         next.getResult());
-    builder.create<firrtl::StrictConnectOp>(loc, assertReg.getResult(),
+    builder.create<firrtl::StrictConnectOp>(loc, assertPorts.writeData,
                                             resetNext.getResult());
-    return assertReg.getResult();
+    return assertPorts.readData;
   }
 
   return topOr;
@@ -1211,7 +1317,12 @@ public:
         targetModule(*this, "target-module",
                      llvm::cl::desc(
                          "Exact module whose definition subtree is covered"),
-                     llvm::cl::init("")) {}
+                     llvm::cl::init("")),
+        coverageInitDir(
+            *this, "coverage-init-dir",
+            llvm::cl::desc(
+                "Absolute directory containing zeros-<depth>.hex files"),
+            llvm::cl::init("")) {}
 
   ModernRegCoverageCovSumPass(const ModernRegCoverageCovSumPass &other)
       : PassWrapper(other),
@@ -1222,13 +1333,20 @@ public:
         targetModule(*this, "target-module",
                      llvm::cl::desc(
                          "Exact module whose definition subtree is covered"),
-                     llvm::cl::init("")) {
+                     llvm::cl::init("")),
+        coverageInitDir(
+            *this, "coverage-init-dir",
+            llvm::cl::desc(
+                "Absolute directory containing zeros-<depth>.hex files"),
+            llvm::cl::init("")) {
     statePlan = other.statePlan.getValue();
     targetModule = other.targetModule.getValue();
+    coverageInitDir = other.coverageInitDir.getValue();
   }
 
   Option<std::string> statePlan;
   Option<std::string> targetModule;
+  Option<std::string> coverageInitDir;
 
   StringRef getArgument() const final {
     return "difuzzrtl-modern-regcoverage-covsum";
@@ -1324,6 +1442,34 @@ public:
       infos.push_back(info);
     }
 
+    std::set<uint64_t> initDepths;
+    for (auto &info : infos) {
+      if (info.plan.covMapSize) {
+        initDepths.insert(1);
+        initDepths.insert(info.plan.covMapSize);
+      }
+      if (info.selected) {
+        bool hasStop = false;
+        info.module.walk([&](firrtl::StopOp) { hasStop = true; });
+        if (hasStop)
+          initDepths.insert(1);
+      }
+    }
+    if (coverageInitDir.empty() ||
+        !llvm::sys::path::is_absolute(coverageInitDir)) {
+      circuit.emitError()
+          << "DifuzzRTL regCoverage requires an absolute "
+             "coverage-init-dir";
+      signalPassFailure();
+      return;
+    }
+    for (auto depth : initDepths) {
+      if (failed(ensureZeroInitFile(circuit, coverageInitDir, depth))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
     for (auto &info : infos) {
       SmallVector<std::pair<unsigned, firrtl::PortInfo>> inserts;
       unsigned nextPort = info.oldPortCount;
@@ -1373,13 +1519,14 @@ public:
     for (auto &info : infos) {
       OpBuilder bodyBuilder = info.module.getBodyBuilder();
       auto loc = info.module.getLoc();
-      info.localCovSum = insertLocalCoverage(info.module, info.plan);
+      info.localCovSum =
+          insertLocalCoverage(info.module, info.plan, coverageInitDir);
       auto metaAssertPort = info.module.getArgument(info.metaAssertPortIndex);
       auto metaResetPort = info.module.getArgument(info.metaResetPortIndex);
       // metaReset is instrumentation-only; it must never rewrite DUT state.
       info.localMetaAssert =
           insertMetaAssert(info.module, info.childMetaAsserts, metaResetPort,
-                           info.selected);
+                           info.selected, coverageInitDir);
 
       Value sum = info.localCovSum ? info.localCovSum
                                    : constantUInt(bodyBuilder, loc, 30, 0);

@@ -15,6 +15,7 @@ cmake --build "${BUILD_DIR}" >/dev/null
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
+ZERO_INIT_DIR="${TMP_DIR}/zero-init"
 
 run_low() {
   local name="$1"
@@ -44,11 +45,11 @@ for plan in compressed legacy-like; do
   "${FIRTOOL}" "${ROOT_DIR}/tests/target.fir" \
     --mlir-print-op-on-diagnostic=false \
     --load-pass-plugin="${PLUGIN}" \
-    --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{state-plan=${plan} target-module=TargetRoot})" \
+    --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{state-plan=${plan} target-module=TargetRoot coverage-init-dir=${ZERO_INIT_DIR}})" \
     --ir-fir >"${TMP_DIR}/target-${plan}.mlir" 2>&1
-  grep -q '%TargetRoot_state = firrtl.reg' "${TMP_DIR}/target-${plan}.mlir"
-  grep -q '%TargetLeaf_state = firrtl.reg' "${TMP_DIR}/target-${plan}.mlir"
-  if grep -Eq '%(Top|Outside)_state = firrtl.reg' "${TMP_DIR}/target-${plan}.mlir"; then
+  grep -q '%TargetRoot_state_read, %TargetRoot_state_write = firrtl.mem' "${TMP_DIR}/target-${plan}.mlir"
+  grep -q '%TargetLeaf_state_read, %TargetLeaf_state_write = firrtl.mem' "${TMP_DIR}/target-${plan}.mlir"
+  if grep -Eq '%(Top|Outside)_state_read, .* = firrtl.mem' "${TMP_DIR}/target-${plan}.mlir"; then
     echo "target-module selected state outside TargetRoot" >&2
     exit 1
   fi
@@ -64,7 +65,7 @@ grep -q 'target_module=TargetRoot modules=2' "${TMP_DIR}/target-audit.log"
 if "${FIRTOOL}" "${ROOT_DIR}/tests/target-shared.fir" \
   --mlir-print-op-on-diagnostic=false \
   --load-pass-plugin="${PLUGIN}" \
-  --low-firrtl-pass-plugin='firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{target-module=TargetRoot})' \
+  --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{target-module=TargetRoot coverage-init-dir=${ZERO_INIT_DIR}})" \
   --disable-output >"${TMP_DIR}/target-shared.log" 2>&1; then
   echo "expected cross-boundary shared target descendant to fail" >&2
   exit 1
@@ -74,12 +75,36 @@ grep -q 'is not instance-exact' "${TMP_DIR}/target-shared.log"
 if "${FIRTOOL}" "${ROOT_DIR}/tests/target.fir" \
   --mlir-print-op-on-diagnostic=false \
   --load-pass-plugin="${PLUGIN}" \
-  --low-firrtl-pass-plugin='firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{target-module=Missing})' \
+  --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{target-module=Missing coverage-init-dir=${ZERO_INIT_DIR}})" \
   --disable-output >"${TMP_DIR}/target-missing.log" 2>&1; then
   echo "expected missing target module to fail" >&2
   exit 1
 fi
 grep -q 'target module `Missing` does not exist' "${TMP_DIR}/target-missing.log"
+
+if "${FIRTOOL}" "${ROOT_DIR}/tests/simple.fir" \
+  --mlir-print-op-on-diagnostic=false \
+  --load-pass-plugin="${PLUGIN}" \
+  --low-firrtl-pass-plugin='firrtl.circuit(difuzzrtl-modern-regcoverage-covsum)' \
+  --disable-output >"${TMP_DIR}/missing-init.log" 2>&1; then
+  echo "expected missing coverage-init-dir to fail" >&2
+  exit 1
+fi
+grep -q 'requires an absolute coverage-init-dir' "${TMP_DIR}/missing-init.log"
+
+BAD_INIT_DIR="${TMP_DIR}/bad-init"
+mkdir -p "${BAD_INIT_DIR}"
+printf '0\n' >"${BAD_INIT_DIR}/zeros-1.hex"
+printf '0\n' >"${BAD_INIT_DIR}/zeros-2.hex"
+if "${FIRTOOL}" "${ROOT_DIR}/tests/simple.fir" \
+  --mlir-print-op-on-diagnostic=false \
+  --load-pass-plugin="${PLUGIN}" \
+  --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{coverage-init-dir=${BAD_INIT_DIR}})" \
+  --disable-output >"${TMP_DIR}/short-init.log" 2>&1; then
+  echo "expected short coverage initialization file to fail" >&2
+  exit 1
+fi
+grep -q 'has 1 entries; expected 2' "${TMP_DIR}/short-init.log"
 
 run_low aggregate
 grep -q 'regs=1' "${TMP_DIR}/aggregate.log"
@@ -112,7 +137,7 @@ for plan in compressed legacy-like; do
   "${FIRTOOL}" "${ROOT_DIR}/tests/simple.fir" \
     --mlir-print-op-on-diagnostic=false \
     --load-pass-plugin="${PLUGIN}" \
-    --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{state-plan=${plan}})" \
+    --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{state-plan=${plan} coverage-init-dir=${ZERO_INIT_DIR}})" \
     --ir-fir >"${TMP_DIR}/simple-covsum-${plan}.mlir" 2>&1
 done
 python3 - "${TMP_DIR}/simple-covsum-compressed.mlir" \
@@ -126,9 +151,9 @@ from pathlib import Path
 for path in map(Path, sys.argv[1:]):
     text = path.read_text(encoding="utf-8")
     for token in (
-        "%Top_state = firrtl.reg",
+        "%Top_state_read, %Top_state_write = firrtl.mem",
         "%Top_cov_read, %Top_cov_write = firrtl.mem",
-        "%Top_covSum = firrtl.reg",
+        "%Top_covSum_read, %Top_covSum_write = firrtl.mem",
     ):
         if token not in text:
             raise SystemExit(f"{path.name}: missing {token}")
@@ -136,11 +161,11 @@ for path in map(Path, sys.argv[1:]):
         raise SystemExit(f"{path.name}: io_state must not be emitted")
     if not re.search(r"firrtl\.strictconnect %r, %a", text):
         raise SystemExit(f"{path.name}: instrumentation changed original register r")
-    if "%Top_metaAssert = firrtl.reg" in text:
+    if "%Top_metaAssert_read, %Top_metaAssert_write = firrtl.mem" in text:
         raise SystemExit(f"{path.name}: unexpected metaAssert register")
     if not re.search(r"firrtl\.strictconnect %metaAssert, %c0_ui1", text):
         raise SystemExit(f"{path.name}: empty metaAssert must be zero")
-    if not re.search(r"firrtl\.strictconnect %io_covSum, %Top_covSum", text):
+    if not re.search(r"firrtl\.strictconnect %io_covSum, %\w+", text):
         raise SystemExit(f"{path.name}: missing covSum output")
 PY
 
@@ -154,23 +179,56 @@ PY
 for plan in compressed legacy-like; do
   "${FIRTOOL}" "${ROOT_DIR}/tests/simple.fir" \
     --load-pass-plugin="${PLUGIN}" \
-    --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{state-plan=${plan}})" \
+    --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{state-plan=${plan} coverage-init-dir=${ZERO_INIT_DIR}})" \
     --verilog -o "${TMP_DIR}/simple-${plan}.sv" >/dev/null 2>&1
+  python3 - "${TMP_DIR}/simple-${plan}.sv" "${ZERO_INIT_DIR}" <<'PY'
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+init_dir = str(Path(sys.argv[2]).resolve())
+blocks = [
+    block for block in re.findall(r"initial begin.*?end // initial", text, re.S)
+    if "$readmemh" in block and init_dir in block
+]
+if len(blocks) < 3:
+    raise SystemExit("inserted state/bitmap/covSum memories are not initialized")
+for block in blocks:
+    random = block.find("`ifdef RANDOMIZE_MEM_INIT")
+    if random < 0 or block.find("$readmemh") > random:
+        raise SystemExit("expected CIRCT 1.59 $readmemh before optional SV randomization")
+for filename in ("zeros-1.hex", "zeros-2.hex"):
+    if filename not in text:
+        raise SystemExit(f"missing expected initialization file {filename}")
+PY
   "${VERILATOR}" --binary --timing -Wno-fatal -DINSTRUMENTED --top-module tb \
     --Mdir "${TMP_DIR}/obj-${plan}" -o sim \
     "${TMP_DIR}/simple-${plan}.sv" "${ROOT_DIR}/tests/noninterference_tb.sv" \
     >/dev/null 2>&1
   "${TMP_DIR}/obj-${plan}/sim" | grep '^TRACE ' >"${TMP_DIR}/${plan}.trace"
   cmp "${TMP_DIR}/baseline.trace" "${TMP_DIR}/${plan}.trace"
+
+  "${VERILATOR}" --binary --timing -Wno-fatal --top-module tb \
+    --Mdir "${TMP_DIR}/obj-init-${plan}" -o sim \
+    "${TMP_DIR}/simple-${plan}.sv" "${ROOT_DIR}/tests/coverage_init_tb.sv" \
+    >/dev/null 2>&1
+  for seed in 1 987654; do
+    "${TMP_DIR}/obj-init-${plan}/sim" \
+      +verilator+rand+reset+2 +verilator+seed+${seed} \
+      | grep '^COV ' >"${TMP_DIR}/${plan}-${seed}.cov"
+  done
+  cmp "${TMP_DIR}/${plan}-1.cov" "${TMP_DIR}/${plan}-987654.cov"
 done
 
 "${FIRTOOL}" "${ROOT_DIR}/tests/stop.fir" \
   --mlir-print-op-on-diagnostic=false \
   --load-pass-plugin="${PLUGIN}" \
-  --low-firrtl-pass-plugin='firrtl.circuit(difuzzrtl-modern-regcoverage-covsum)' \
+  --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{coverage-init-dir=${ZERO_INIT_DIR}})" \
   --ir-fir >"${TMP_DIR}/stop-covsum.mlir" 2>&1
-grep -q '%Top_metaAssert = firrtl.reg' "${TMP_DIR}/stop-covsum.mlir"
-grep -q 'firrtl.strictconnect %metaAssert, %Top_metaAssert' "${TMP_DIR}/stop-covsum.mlir"
+grep -q '%Top_metaAssert_read, %Top_metaAssert_write = firrtl.mem' "${TMP_DIR}/stop-covsum.mlir"
 python3 - "${TMP_DIR}/stop-covsum.mlir" <<'PY'
 from __future__ import annotations
 
@@ -179,25 +237,24 @@ import sys
 from pathlib import Path
 
 text = Path(sys.argv[1]).read_text(encoding="utf-8")
-if not re.search(
-    r"(%\w+) = firrtl\.mux\(%metaReset, [^,]+, %\w+\).*?\n\s*firrtl\.strictconnect %Top_metaAssert, \1",
-    text,
-):
-    raise SystemExit("stop-backed metaAssert register is not guarded by metaReset")
+if not re.search(r"firrtl\.mux\(%metaReset, [^,]+, %\w+\)", text):
+    raise SystemExit("stop-backed metaAssert metadata is not guarded by metaReset")
+if not re.search(r"firrtl\.strictconnect %metaAssert, %\w+", text):
+    raise SystemExit("stop-backed metaAssert output is not connected")
 PY
 
 "${FIRTOOL}" "${ROOT_DIR}/tests/multiclock.fir" \
   --mlir-print-op-on-diagnostic=false \
   --load-pass-plugin="${PLUGIN}" \
-  --low-firrtl-pass-plugin='firrtl.circuit(difuzzrtl-modern-regcoverage-covsum)' \
+  --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{coverage-init-dir=${ZERO_INIT_DIR}})" \
   --ir-fir >"${TMP_DIR}/multiclock-covsum.mlir" 2>&1
-grep -q '%Top_state = firrtl.reg interesting_name %clock1' "${TMP_DIR}/multiclock-covsum.mlir"
-grep -q '%Top_covSum = firrtl.reg interesting_name %clock1' "${TMP_DIR}/multiclock-covsum.mlir"
+grep -q '%Top_state_read, %Top_state_write = firrtl.mem' "${TMP_DIR}/multiclock-covsum.mlir"
+grep -q '%Top_covSum_read, %Top_covSum_write = firrtl.mem' "${TMP_DIR}/multiclock-covsum.mlir"
 
 "${FIRTOOL}" "${ROOT_DIR}/tests/instance.fir" \
   --mlir-print-op-on-diagnostic=false \
   --load-pass-plugin="${PLUGIN}" \
-  --low-firrtl-pass-plugin='firrtl.circuit(difuzzrtl-modern-regcoverage-covsum)' \
+  --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{coverage-init-dir=${ZERO_INIT_DIR}})" \
   --ir-fir >"${TMP_DIR}/instance-covsum.mlir" 2>&1
 grep -q 'out %io_covSum: !firrtl.uint<30>' "${TMP_DIR}/instance-covsum.mlir"
 grep -q 'out io_covSum: !firrtl.uint<30>' "${TMP_DIR}/instance-covsum.mlir"
@@ -212,7 +269,7 @@ fi
 "${FIRTOOL}" "${ROOT_DIR}/tests/instance.fir" \
   --mlir-print-op-on-diagnostic=false \
   --load-pass-plugin="${PLUGIN}" \
-  --low-firrtl-pass-plugin='firrtl.circuit(difuzzrtl-modern-regcoverage-covsum)' \
+  --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{coverage-init-dir=${ZERO_INIT_DIR}})" \
   --verilog -o "${TMP_DIR}/instance-covsum.sv" >/dev/null 2>&1
 
 echo "DifuzzRTL modern regCoverage smoke passed."
