@@ -66,6 +66,8 @@ class rvRTLhost():
         self.last_dt_group_observation = None
         self.last_dt_group_handle_count = 0
         self.last_cycles = 0
+        self.last_trace_events = 0
+        self.last_main_trace_events = 0
 
     def debug_print(self, message):
         if self.debug:
@@ -150,6 +152,8 @@ class rvRTLhost():
         self.last_dt_group_observation = None
         self.last_dt_group_handle_count = 0
         self.last_cycles = 0
+        self.last_trace_events = 0
+        self.last_main_trace_events = 0
 
         fd = open(rtl_input.hexfile, 'r')
         lines = fd.readlines()
@@ -160,6 +164,7 @@ class rvRTLhost():
         symbols = rtl_input.symbols
         _start = symbols['_start']
         _end = symbols['_end_main']
+        main_start = symbols['_fuzz_main']
 
         (bootrom_addrs, memory) = self.set_bootrom()
         for (i, addr) in enumerate(range(_start, _end + 36, 8)):
@@ -217,6 +222,12 @@ class rvRTLhost():
         self.debug_print('[RTLHost] Execution begin')
         for i in range(max_cycles):
             yield clkedge
+            if self.adapter.pc_valid():
+                self.last_trace_events += 1
+                pc = self.adapter.monitor_pc.value & \
+                    ((1 << len(self.adapter.monitor_pc.value)) - 1)
+                if main_start <= pc < _end:
+                    self.last_main_trace_events += 1
             if target_cov_trace_handles and \
                i % target_bitmap_sample_period == 0:
                 self.coverage.sample_tagged_handles(
