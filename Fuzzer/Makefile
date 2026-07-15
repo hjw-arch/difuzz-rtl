@@ -50,6 +50,7 @@ endif
 PRINTF_COND ?= 0
 STOP_COND ?= 0
 VERILATOR_EXTRA_ARGS ?=
+VERILATOR_VLT_CONFIG ?=
 
 COMPILE_ARGS=$(MULTI) $(INCLUDE) -DPRINTF_COND=$(PRINTF_COND) -DSTOP_COND=$(STOP_COND) -Wno-PINMISSING $(VERILATOR_EXTRA_ARGS)
 PLUSARGS=+DEBUG=$(PRINT) $(PLUSARGS_OUT)
@@ -57,8 +58,15 @@ PLUSARGS=+DEBUG=$(PRINT) $(PLUSARGS_OUT)
 MODULE=DifuzzRTL
 
 CUSTOM_SIM_DEPS=$(CWD)/Makefile
+ifneq ($(strip $(VERILATOR_VLT_CONFIG)),)
+CUSTOM_COMPILE_DEPS += $(VERILATOR_VLT_CONFIG)
+endif
 
 include $(shell cocotb-config --makefiles)/Makefile.inc
 include $(shell cocotb-config --makefiles)/Makefile.sim
+
+ifneq ($(strip $(VERILATOR_VLT_CONFIG)),)
+COMPILE_ARGS := $(filter-out --public-flat-rw,$(COMPILE_ARGS)) $(VERILATOR_VLT_CONFIG)
+endif
 
 sim: $(MODULE).py
