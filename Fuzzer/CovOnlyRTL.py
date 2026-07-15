@@ -13,6 +13,7 @@ experiments.
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import time
@@ -30,6 +31,7 @@ from src.coverage_utils import (
 from src.env_parser import envParser
 from src.mutator import GENERATION, rvMutator
 from src.preprocessor import rvPreProcessor
+from fuzzer.rtl_coverage import DtGroupCoverageTracker
 
 
 def _mkdir(path: str) -> None:
@@ -241,6 +243,14 @@ def RunCovOnly(dut, toplevel,
         raise ValueError("DT Group manifest has no selected feedback bits")
     max_seconds = float(max_seconds or 0)
     wall_start = float(start_time or time.time())
+    dtg_tracker = (
+        DtGroupCoverageTracker(rtl_host.dt_group.provider.schema)
+        if getattr(rtl_host.dt_group, "provider", None) is not None else None
+    )
+    dtg_feedback_targets = set()
+    dtg_samples = dtg_rtl_runs = dtg_successful_runs = 0
+    dtg_statuses = {}
+    dtg_last_iter = None
 
     for it in range(int(num_iter)):
         if max_seconds > 0 and it > 0 and time.time() - wall_start >= max_seconds:
@@ -307,6 +317,18 @@ def RunCovOnly(dut, toplevel,
         else:
             ret, coverage = result
             module_covs = last_module_covs.copy()
+
+        if dtg_tracker is not None:
+            observation = getattr(rtl_host, "last_dt_group_observation", None)
+            if observation is not None:
+                dtg_tracker.observe(observation, iteration=it)
+                dtg_feedback_targets.update(observation.feedback_targets)
+                dtg_samples += len(getattr(rtl_host.dt_group, "rows", ()) or ())
+                dtg_last_iter = it
+            status = _status_name(ret)
+            dtg_statuses[status] = dtg_statuses.get(status, 0) + 1
+            dtg_rtl_runs += 1
+            dtg_successful_runs += int(ret == SUCCESS)
 
         t0 = time.perf_counter()
         bitmap_target_hit_bits = set(
@@ -391,6 +413,22 @@ def RunCovOnly(dut, toplevel,
                 selection["value"],
                 selection["best_alt_value"],
             ])
+
+    if dtg_tracker is not None:
+        _write(
+            os.path.join(out, "dtg_state.json"),
+            json.dumps({
+                "schema": "deltartl-dtg-runtime-v1",
+                "iterations_requested": int(num_iter),
+                "rtl_runs": dtg_rtl_runs,
+                "successful_runs": dtg_successful_runs,
+                "status_counts": dtg_statuses,
+                "samples": dtg_samples,
+                "unique_feedback_targets": len(dtg_feedback_targets),
+                "state": dtg_tracker.snapshot(current_iter=dtg_last_iter),
+            }, indent=2, sort_keys=True) + "\n",
+            "w",
+        )
 
 
 parser = envParser()
