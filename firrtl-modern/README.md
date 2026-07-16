@@ -104,8 +104,9 @@ Version-boundary rule:
 Build:
 
 ```sh
+export FIRTOOL_ROOT=/path/to/firtool-install
 cmake -S fuzzer/difuzz-rtl/firrtl-modern -B /tmp/difuzzrtl-modern-regcov-build \
-  -DFIRTOOL_ROOT=/home/hjw-arch/FuzzerBenchmark/.cache/rocket-tools/firtool-1.59.0
+  -DFIRTOOL_ROOT="$FIRTOOL_ROOT"
 cmake --build /tmp/difuzzrtl-modern-regcov-build
 ```
 

@@ -4,7 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
-FIRTOOL_ROOT="${FIRTOOL_ROOT:-/home/hjw-arch/FuzzerBenchmark/.cache/rocket-tools/firtool-1.59.0}"
+FIRTOOL_ROOT="${FIRTOOL_ROOT:-${DELTARTL_FIRTOOL_ROOT:-}}"
+if [[ -z "$FIRTOOL_ROOT" ]]; then
+  echo "set FIRTOOL_ROOT to a CIRCT/firtool installation" >&2
+  exit 2
+fi
 BUILD_DIR="${BUILD_DIR:-/tmp/difuzzrtl-modern-regcov-build}"
 FIRTOOL="${FIRTOOL_ROOT}/bin/firtool"
 PLUGIN="${BUILD_DIR}/libDifuzzRTLModernRegCoverage.so"

@@ -2,9 +2,11 @@ cmake_minimum_required(VERSION 3.20)
 
 project(DifuzzRTLModernRegCoverage LANGUAGES CXX C)
 
-set(FIRTOOL_ROOT
-  "/home/hjw-arch/FuzzerBenchmark/.cache/rocket-tools/firtool-1.59.0"
-  CACHE PATH "CIRCT/firtool installation used to build and load the plugin")
+set(FIRTOOL_ROOT "" CACHE PATH
+  "CIRCT/firtool installation used to build and load the plugin")
+if(NOT EXISTS "${FIRTOOL_ROOT}/bin/llvm-config")
+  message(FATAL_ERROR "Set FIRTOOL_ROOT to a CIRCT/firtool installation")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
