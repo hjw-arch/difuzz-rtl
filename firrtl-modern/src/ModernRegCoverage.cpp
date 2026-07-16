@@ -211,6 +211,82 @@ static LogicalResult selectTargetModules(firrtl::CircuitOp circuit,
   return success();
 }
 
+static LogicalResult selectPortModules(firrtl::CircuitOp circuit,
+                                       StringRef targetModule,
+                                       const llvm::StringSet<> &selected,
+                                       llvm::StringSet<> &ports) {
+  for (const auto &entry : selected)
+    ports.insert(entry.getKey());
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    circuit.walk([&](firrtl::FModuleOp module) {
+      if (ports.contains(module.getName()))
+        return;
+      bool hasPortChild = false;
+      module.walk([&](firrtl::InstanceOp inst) {
+        hasPortChild |= ports.contains(inst.getModuleName());
+      });
+      if (hasPortChild)
+        changed |= ports.insert(module.getName()).second;
+    });
+  }
+
+  if (!targetModule.empty()) {
+    auto mainModule = circuit.getMainModule();
+    if (!mainModule || !ports.contains(mainModule.getModuleName())) {
+      circuit.emitError() << "DifuzzRTL regCoverage target module `"
+                          << targetModule
+                          << "` has no observation path to the circuit top";
+      return failure();
+    }
+
+    llvm::StringSet<> reachable;
+    reachable.insert(mainModule.getModuleName());
+    changed = true;
+    while (changed) {
+      changed = false;
+      circuit.walk([&](firrtl::FModuleOp module) {
+        if (!reachable.contains(module.getName()))
+          return;
+        module.walk([&](firrtl::InstanceOp inst) {
+          if (ports.contains(inst.getModuleName()))
+            changed |= reachable.insert(inst.getModuleName()).second;
+        });
+      });
+    }
+    for (const auto &entry : ports) {
+      if (!reachable.contains(entry.getKey())) {
+        circuit.emitError()
+            << "DifuzzRTL regCoverage target module `" << targetModule
+            << "` has a disconnected observation path through module `"
+            << entry.getKey() << "`";
+        return failure();
+      }
+    }
+  }
+
+  bool invalid = false;
+  circuit.walk([&](firrtl::FModuleOp module) {
+    if (!ports.contains(module.getName()) ||
+        selected.contains(module.getName()))
+      return;
+    unsigned portChildren = 0;
+    module.walk([&](firrtl::InstanceOp inst) {
+      portChildren += ports.contains(inst.getModuleName());
+    });
+    if (portChildren != 1) {
+      module.emitError()
+          << "DifuzzRTL regCoverage target module `" << targetModule
+          << "` requires exactly one observation-path child in outer module `"
+          << module.getName() << "`, found " << portChildren;
+      invalid = true;
+    }
+  });
+  return failure(invalid);
+}
+
 static firrtl::UIntType getUInt(MLIRContext *ctx, unsigned width) {
   return firrtl::UIntType::get(ctx, width);
 }
@@ -1258,8 +1334,7 @@ static Value orReduce(OpBuilder &builder, Location loc, ArrayRef<Value> values) 
 
 static Value insertMetaAssert(firrtl::FModuleOp module,
                               ArrayRef<Value> childMetaAsserts,
-                              Value metaReset, bool includeLocal,
-                              StringRef initDirectory) {
+                              Value metaReset, StringRef initDirectory) {
   OpBuilder builder = module.getBodyBuilder();
   auto loc = module.getLoc();
   auto *ctx = module.getContext();
@@ -1275,8 +1350,7 @@ static Value insertMetaAssert(firrtl::FModuleOp module,
   }
 
   SmallVector<Value> terms;
-  if (includeLocal)
-    module.walk([&](firrtl::StopOp stop) { terms.push_back(stop.getCond()); });
+  module.walk([&](firrtl::StopOp stop) { terms.push_back(stop.getCond()); });
   terms.append(childMetaAsserts.begin(), childMetaAsserts.end());
   if (terms.empty())
     return constantUInt(builder, loc, 1, 0);
@@ -1396,10 +1470,18 @@ public:
       signalPassFailure();
       return;
     }
+    llvm::StringSet<> portModules;
+    if (failed(selectPortModules(circuit, targetModule, selectedModules,
+                                 portModules))) {
+      signalPassFailure();
+      return;
+    }
 
     SmallVector<firrtl::FModuleOp> modules;
     llvm::StringMap<unsigned> moduleIndex;
     circuit.walk([&](firrtl::FModuleOp module) {
+      if (!portModules.contains(module.getName()))
+        return;
       moduleIndex[module.getName()] = modules.size();
       modules.push_back(module);
     });
@@ -1519,14 +1601,26 @@ public:
     for (auto &info : infos) {
       OpBuilder bodyBuilder = info.module.getBodyBuilder();
       auto loc = info.module.getLoc();
-      info.localCovSum =
-          insertLocalCoverage(info.module, info.plan, coverageInitDir);
+      auto covSumPort = info.module.getArgument(info.covSumPortIndex);
       auto metaAssertPort = info.module.getArgument(info.metaAssertPortIndex);
       auto metaResetPort = info.module.getArgument(info.metaResetPortIndex);
+
+      if (!info.selected) {
+        bodyBuilder.create<firrtl::StrictConnectOp>(loc, covSumPort,
+                                                    info.childCovSums.front());
+        bodyBuilder.create<firrtl::StrictConnectOp>(
+            loc, metaAssertPort, info.childMetaAsserts.front());
+        bodyBuilder.create<firrtl::StrictConnectOp>(
+            loc, info.childMetaResets.front(), metaResetPort);
+        continue;
+      }
+
+      info.localCovSum =
+          insertLocalCoverage(info.module, info.plan, coverageInitDir);
       // metaReset is instrumentation-only; it must never rewrite DUT state.
       info.localMetaAssert =
           insertMetaAssert(info.module, info.childMetaAsserts, metaResetPort,
-                           info.selected, coverageInitDir);
+                           coverageInitDir);
 
       Value sum = info.localCovSum ? info.localCovSum
                                    : constantUInt(bodyBuilder, loc, 30, 0);
@@ -1537,7 +1631,6 @@ public:
         sum = truncateToUInt30(bodyBuilder, loc, wideSum.getResult());
       }
 
-      auto covSumPort = info.module.getArgument(info.covSumPortIndex);
       bodyBuilder.create<firrtl::StrictConnectOp>(loc, covSumPort, sum);
       bodyBuilder.create<firrtl::StrictConnectOp>(loc, metaAssertPort,
                                                   info.localMetaAssert);

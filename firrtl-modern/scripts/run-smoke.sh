@@ -49,10 +49,17 @@ for plan in compressed legacy-like; do
     --ir-fir >"${TMP_DIR}/target-${plan}.mlir" 2>&1
   grep -q '%TargetRoot_state_read, %TargetRoot_state_write = firrtl.mem' "${TMP_DIR}/target-${plan}.mlir"
   grep -q '%TargetLeaf_state_read, %TargetLeaf_state_write = firrtl.mem' "${TMP_DIR}/target-${plan}.mlir"
-  if grep -Eq '%(Top|Outside)_state_read, .* = firrtl.mem' "${TMP_DIR}/target-${plan}.mlir"; then
+  if grep -Eq '%(Top|Outside)_(state|cov|covSum|metaAssert)_read, .* = firrtl.mem' "${TMP_DIR}/target-${plan}.mlir"; then
     echo "target-module selected state outside TargetRoot" >&2
     exit 1
   fi
+  if grep -E 'firrtl\.module private @Outside\(.*(io_covSum|metaAssert|metaReset)' "${TMP_DIR}/target-${plan}.mlir"; then
+    echo "target-module added ports to an unrelated module" >&2
+    exit 1
+  fi
+  grep -q 'firrtl.strictconnect %io_covSum, %target_io_covSum' "${TMP_DIR}/target-${plan}.mlir"
+  grep -q 'firrtl.strictconnect %metaAssert, %target_metaAssert' "${TMP_DIR}/target-${plan}.mlir"
+  grep -q 'firrtl.strictconnect %target_metaReset, %metaReset' "${TMP_DIR}/target-${plan}.mlir"
 done
 
 "${FIRTOOL}" "${ROOT_DIR}/tests/target.fir" \
@@ -71,6 +78,32 @@ if "${FIRTOOL}" "${ROOT_DIR}/tests/target-shared.fir" \
   exit 1
 fi
 grep -q 'is not instance-exact' "${TMP_DIR}/target-shared.log"
+
+if "${FIRTOOL}" "${ROOT_DIR}/tests/target-multiple.fir" \
+  --mlir-print-op-on-diagnostic=false \
+  --load-pass-plugin="${PLUGIN}" \
+  --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{target-module=TargetRoot coverage-init-dir=${ZERO_INIT_DIR}})" \
+  --disable-output >"${TMP_DIR}/target-multiple.log" 2>&1; then
+  echo "expected a non-unique outer observation path to fail" >&2
+  exit 1
+fi
+grep -q 'requires exactly one observation-path child' "${TMP_DIR}/target-multiple.log"
+
+"${FIRTOOL}" "${ROOT_DIR}/tests/target-detached.mlir" \
+  --mlir-print-op-on-diagnostic=false \
+  --load-pass-plugin="${PLUGIN}" \
+  --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{coverage-init-dir=${ZERO_INIT_DIR}})" \
+  --disable-output >"${TMP_DIR}/target-detached-default.log" 2>&1
+
+if "${FIRTOOL}" "${ROOT_DIR}/tests/target-detached.mlir" \
+  --mlir-print-op-on-diagnostic=false \
+  --load-pass-plugin="${PLUGIN}" \
+  --low-firrtl-pass-plugin="firrtl.circuit(difuzzrtl-modern-regcoverage-covsum{target-module=TargetRoot coverage-init-dir=${ZERO_INIT_DIR}})" \
+  --disable-output >"${TMP_DIR}/target-detached.log" 2>&1; then
+  echo "expected a disconnected public observation path to fail" >&2
+  exit 1
+fi
+grep -q 'has a disconnected observation path' "${TMP_DIR}/target-detached.log"
 
 if "${FIRTOOL}" "${ROOT_DIR}/tests/target.fir" \
   --mlir-print-op-on-diagnostic=false \

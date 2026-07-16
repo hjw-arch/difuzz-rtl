@@ -64,11 +64,16 @@ Implemented pass entry points:
   first evaluation reloads only inserted metadata from the zero files.
 * `target-module=<exact-name>` limits local coverage and local stop collection
   to every instance of that module definition and its transitive child
-  definitions.  Other modules only aggregate `io_covSum`/`metaAssert` and
-  propagate `metaReset`.
+  definitions.  Unrelated modules are unchanged.  Each outer module on the
+  unique path to the circuit top only lifts `io_covSum`/`metaAssert` and
+  propagates `metaReset` through ports and direct connections; it contains no
+  inserted state or aggregation logic.
   A missing target fails, as does a selected descendant definition also
-  instantiated outside the selected closure; this keeps module selection
-  instance-exact instead of silently instrumenting unrelated hierarchy.
+  instantiated outside the selected closure or a non-unique outer observation
+  path.  Every lifted path must also be reachable from the circuit top, so a
+  retained but disconnected public module cannot be modified.  This keeps
+  module selection instance-exact instead of silently instrumenting unrelated
+  hierarchy.
 * `metaReset` clears only the inserted sticky module-local `metaAssert`
   storage.  It never rewrites a pre-existing DUT register.  It deliberately
   does not clear inserted coverage state, the coverage bitmap, or `covSum`,
